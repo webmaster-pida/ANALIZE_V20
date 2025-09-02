@@ -1,5 +1,4 @@
 import os
-import base64
 import requests
 import json
 import io
@@ -13,23 +12,20 @@ from docx.shared import Pt
 from fpdf import FPDF
 from markdown_it import MarkdownIt
 from datetime import datetime
+import google.generativeai as genai
 
 from src.core.prompts import ANALYZER_SYSTEM_PROMPT
 
 # Cargar variables de entorno
 load_dotenv()
 
-# Configurar la API Key de Gemini
+# --- SECCIÓN DE CONFIGURACIÓN MODIFICADA PARA EL SDK ---
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 if not GEMINI_API_KEY:
     raise ValueError("No se encontró la variable de entorno GEMINI_API_KEY")
 
-# Obtener el modelo de Gemini desde las variables de entorno
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
-
-# --- SECCIÓN DE CONFIGURACIÓN MODIFICADA ---
-# Se cambió el endpoint de 'v1beta' a 'v1' para usar modelos estables.
-GEMINI_API_URL = f"https://generativelanguage.googleapis.com/v1/models/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
+# Configura el SDK de Google
+genai.configure(api_key=GEMINI_API_KEY)
 # --- FIN DE LA MODIFICACIÓN ---
 
 app = FastAPI(title="PIDA Document Analyzer API")
@@ -77,59 +73,50 @@ class PDF(FPDF):
         self.set_text_color(128, 128, 128)
         self.cell(0, 10, f"Página {self.page_no()}/{{nb}}", 0, 0, "C")
 
+# --- FUNCIÓN DE ANÁLISIS REFACTORIZADA CON EL SDK ---
 @app.post("/analyze-documents")
 async def analyze_documents(files: List[UploadFile] = File(...), instructions: str = Form(...)):
     if len(files) > 5:
         raise HTTPException(status_code=400, detail="Se permite un máximo de 5 archivos.")
-    file_parts = []
+
+    # 1. Configuración del modelo y parámetros
+    gemini_model_name = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
+    temperature = float(os.getenv("GEMINI_TEMP", 0.3))
+    top_p = float(os.getenv("GEMINI_TOP_P", 0.95))
+
+    generation_config = genai.types.GenerationConfig(
+        temperature=temperature,
+        top_p=top_p
+    )
+
+    # 2. Prepara los archivos para el SDK
+    prompt_parts = []
     for file in files:
         if file.content_type not in ["application/pdf", "application/msword", "application/vnd.openxmlformats-officedocument.wordprocessingml.document"]:
             raise HTTPException(status_code=400, detail=f"Tipo de archivo no soportado: {file.filename}")
-        contents = await file.read()
-        encoded_contents = base64.b64encode(contents).decode("utf-8")
-        file_parts.append({"inline_data": {"mime_type": file.content_type, "data": encoded_contents}})
-    
-    prompt_parts = [*file_parts, {"text": f"\n--- \nInstrucciones del Usuario: {instructions}"}]
-
-    generation_config = {}
-    
-    temp_env = os.getenv("GEMINI_TEMP")
-    if temp_env:
-        try:
-            generation_config["temperature"] = float(temp_env)
-        except ValueError:
-            print(f"Advertencia: El valor de GEMINI_TEMP ('{temp_env}') no es un número válido. Se ignorará.")
-
-    top_p_env = os.getenv("GEMINI_TOP_P")
-    if top_p_env:
-        try:
-            generation_config["topP"] = float(top_p_env)
-        except ValueError:
-            print(f"Advertencia: El valor de GEMINI_TOP_P ('{top_p_env}') no es un número válido. Se ignorará.")
-            
-    request_payload = {
-        "contents": [{"parts": prompt_parts}],
-        "systemInstruction": {"parts": [{"text": ANALYZER_SYSTEM_PROMPT}]}
-    }
-
-    if generation_config:
-        request_payload["generationConfig"] = generation_config
         
+        contents = await file.read()
+        prompt_parts.append({"mime_type": file.content_type, "data": contents})
+
+    # Añade las instrucciones del usuario al final
+    prompt_parts.append(instructions)
+    
     try:
-        headers = {"Content-Type": "application/json"}
-        response = requests.post(GEMINI_API_URL, headers=headers, data=json.dumps(request_payload))
-        response.raise_for_status()
-        response_json = response.json()
-        if "candidates" in response_json and response_json["candidates"]:
-            first_candidate = response_json["candidates"][0]
-            if "content" in first_candidate and "parts" in first_candidate["content"]:
-                analysis_text = "".join(part.get("text", "") for part in first_candidate["content"]["parts"])
-                return {"analysis": analysis_text}
-        raise HTTPException(status_code=500, detail=f"Respuesta inesperada de la API de Gemini: {response.text}")
-    except requests.exceptions.RequestException as e:
-        raise HTTPException(status_code=502, detail=f"Error al contactar la API de Gemini: {str(e)}")
+        # 3. Inicializa el modelo con el SDK
+        model = genai.GenerativeModel(
+            model_name=gemini_model_name,
+            system_instruction=ANALYZER_SYSTEM_PROMPT,
+            generation_config=generation_config
+        )
+
+        # 4. Llama a la API a través del SDK
+        response = model.generate_content(prompt_parts)
+
+        return {"analysis": response.text}
+
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error interno del servidor: {str(e)}")
+        # El SDK tiene sus propios errores, los capturamos y devolvemos un error genérico
+        raise HTTPException(status_code=500, detail=f"Error al procesar con la API de Gemini: {str(e)}")
 
 
 @app.post("/download-analysis")
