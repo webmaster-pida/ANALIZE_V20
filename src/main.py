@@ -64,8 +64,38 @@ async def analyze_documents(files: List[UploadFile] = File(...), instructions: s
         contents = await file.read()
         encoded_contents = base64.b64encode(contents).decode("utf-8")
         file_parts.append({"inline_data": {"mime_type": file.content_type, "data": encoded_contents}})
+    
     prompt_parts = [*file_parts, {"text": f"\n--- \nInstrucciones del Usuario: {instructions}"}]
-    request_payload = {"contents": [{"parts": prompt_parts}], "systemInstruction": {"parts": [{"text": ANALYZER_SYSTEM_PROMPT}]}}
+
+    # 1. Crear el diccionario de configuración de generación
+    generation_config = {}
+    
+    # 2. Leer y validar la variable de entorno para la temperatura
+    temp_env = os.getenv("GEMINI_TEMP")
+    if temp_env:
+        try:
+            generation_config["temperature"] = float(temp_env)
+        except ValueError:
+            print(f"Advertencia: El valor de GEMINI_TEMP ('{temp_env}') no es un número válido. Se ignorará.")
+
+    # 3. Leer y validar la variable de entorno para el Top_P
+    top_p_env = os.getenv("GEMINI_TOP_P")
+    if top_p_env:
+        try:
+            generation_config["topP"] = float(top_p_env)
+        except ValueError:
+            print(f"Advertencia: El valor de GEMINI_TOP_P ('{top_p_env}') no es un número válido. Se ignorará.")
+            
+    # 4. Construir el payload final para la API
+    request_payload = {
+        "contents": [{"parts": prompt_parts}],
+        "systemInstruction": {"parts": [{"text": ANALYZER_SYSTEM_PROMPT}]}
+    }
+
+    # 5. Añadir la configuración de generación solo si contiene valores
+    if generation_config:
+        request_payload["generationConfig"] = generation_config
+        
     try:
         headers = {"Content-Type": "application/json"}
         response = requests.post(GEMINI_API_URL, headers=headers, data=json.dumps(request_payload))
