@@ -19,12 +19,19 @@ from src.core.prompts import ANALYZER_SYSTEM_PROMPT
 # Cargar variables de entorno
 load_dotenv()
 
-# Configurar la API Key de Gemini
+# --- SECCIÓN DE CONFIGURACIÓN MODIFICADA ---
+# 1. Configurar la API Key de Gemini
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 if not GEMINI_API_KEY:
     raise ValueError("No se encontró la variable de entorno GEMINI_API_KEY")
 
-GEMINI_API_URL = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-latest:generateContent?key={GEMINI_API_KEY}"
+# 2. Obtener el modelo de Gemini desde las variables de entorno
+#    Si no se define, se usa 'gemini-2.5-flash' como valor por defecto.
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+
+# 3. Construir la URL de la API dinámicamente
+GEMINI_API_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
+# --- FIN DE LA MODIFICACIÓN ---
 
 app = FastAPI(title="PIDA Document Analyzer API")
 
@@ -36,38 +43,22 @@ app.add_middleware(
     expose_headers=["Content-Disposition"],
 )
 
-# --- INICIO: NUEVA FUNCIÓN AUXILIAR PARA DOCX ---
 def parse_and_add_markdown_to_docx(document, markdown_text):
-    """
-    Analiza un texto en Markdown y lo añade a un objeto Document de python-docx
-    con el formato correspondiente para títulos y negritas.
-    """
-    # Dividir el texto por líneas para procesar cada una
     for line in markdown_text.strip().split('\n'):
-        # Si la línea es un título (## Texto)
         if line.startswith('## '):
             document.add_heading(line.lstrip('## '), level=2)
-        # Si la línea es un título (# Texto)
         elif line.startswith('# '):
             document.add_heading(line.lstrip('# '), level=1)
-        # Si la línea está vacía, añade un párrafo vacío para espaciado
         elif not line.strip():
             document.add_paragraph('')
-        # Para párrafos con texto normal y negritas
         else:
             p = document.add_paragraph()
-            # Divide la línea por el delimitador de negritas (**)
-            # Esto crea una lista como ['Texto normal ', 'texto en negritas', ' más texto.']
             parts = re.split(r'(\*\*.*?\*\*)', line)
             for part in parts:
                 if part.startswith('**') and part.endswith('**'):
-                    # Añade la parte en negritas
                     p.add_run(part.strip('*')).bold = True
                 else:
-                    # Añade el texto normal
                     p.add_run(part)
-# --- FIN: NUEVA FUNCIÓN AUXILIAR ---
-
 
 class PDF(FPDF):
     def header(self):
@@ -172,11 +163,7 @@ async def download_analysis(
             document.add_paragraph(instructions)
             document.add_heading("Respuesta de PIDA-AI", level=2)
             
-            # --- SECCIÓN DOCX MODIFICADA ---
-            # Se reemplaza el simple document.add_paragraph(analysis_text)
-            # por una llamada a nuestra nueva función.
             parse_and_add_markdown_to_docx(document, analysis_text)
-            # --- FIN DE LA MODIFICACIÓN ---
 
             document.save(file_stream)
             media_type = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
@@ -198,16 +185,12 @@ async def download_analysis(
             pdf.set_text_color(29, 53, 87)
             pdf.cell(0, 10, "Respuesta de PIDA-AI", 0, 1, "L")
             
-            # --- SECCIÓN PDF MODIFICADA ---
-            # Convertimos el Markdown a un HTML simple y usamos el método
-            # write_html de FPDF, que sí interpreta etiquetas como <h2> y <b>.
             md = MarkdownIt()
             html_content = md.render(analysis_text).replace('<h2>', '<h2><font color="#1D3557">').replace('</h2>', '</font></h2>')
             
             pdf.set_font("NotoSans", "", 11)
             pdf.set_text_color(0, 0, 0)
             pdf.write_html(html_content)
-            # --- FIN DE LA MODIFICACIÓN ---
             
             pdf_output = pdf.output()
             file_stream.write(pdf_output)
