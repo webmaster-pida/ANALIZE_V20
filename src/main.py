@@ -19,18 +19,17 @@ from src.core.prompts import ANALYZER_SYSTEM_PROMPT
 # Cargar variables de entorno
 load_dotenv()
 
-# --- SECCIÓN DE CONFIGURACIÓN MODIFICADA ---
-# 1. Configurar la API Key de Gemini
+# Configurar la API Key de Gemini
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 if not GEMINI_API_KEY:
     raise ValueError("No se encontró la variable de entorno GEMINI_API_KEY")
 
-# 2. Obtener el modelo de Gemini desde las variables de entorno
-#    Si no se define, se usa 'gemini-2.5-flash' como valor por defecto.
+# Obtener el modelo de Gemini desde las variables de entorno
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 
-# 3. Construir la URL de la API dinámicamente
-GEMINI_API_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
+# --- SECCIÓN DE CONFIGURACIÓN MODIFICADA ---
+# Se cambió el endpoint de 'v1beta' a 'v1' para usar modelos estables.
+GEMINI_API_URL = f"https://generativelanguage.googleapis.com/v1/models/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
 # --- FIN DE LA MODIFICACIÓN ---
 
 app = FastAPI(title="PIDA Document Analyzer API")
