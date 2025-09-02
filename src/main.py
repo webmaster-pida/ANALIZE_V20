@@ -19,17 +19,12 @@ from src.core.prompts import ANALYZER_SYSTEM_PROMPT
 # Cargar variables de entorno
 load_dotenv()
 
-# --- SECCIÓN DE CONFIGURACIÓN VUELTA A REQUESTS ---
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 if not GEMINI_API_KEY:
     raise ValueError("No se encontró la variable de entorno GEMINI_API_KEY")
 
-# Modelo por defecto es gemini-2.5-flash
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
-
-# Usamos v1beta para asegurar compatibilidad con systemInstruction
 GEMINI_API_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
-# --- FIN DE LA SECCIÓN ---
 
 app = FastAPI(title="PIDA Document Analyzer API")
 
@@ -58,10 +53,15 @@ def parse_and_add_markdown_to_docx(document, markdown_text):
                 else:
                     p.add_run(part)
 
+# --- CLASE PDF MODIFICADA ---
 class PDF(FPDF):
     def header(self):
         self.add_font("NotoSans", "", "fonts/NotoSans-Regular.ttf", uni=True)
         self.add_font("NotoSans", "B", "fonts/NotoSans-Bold.ttf", uni=True)
+        # --- LÍNEA NUEVA AÑADIDA ---
+        # Registramos la fuente en cursiva (Italic)
+        self.add_font("NotoSans", "I", "fonts/NotoSans-Italic.ttf", uni=True)
+        # -------------------------
         self.set_font("NotoSans", "B", 15)
         self.set_text_color(29, 53, 87)
         self.cell(0, 10, "PIDA-AI: Resumen de Consulta", 0, 1, "L")
@@ -75,6 +75,7 @@ class PDF(FPDF):
         self.set_font("NotoSans", "", 8)
         self.set_text_color(128, 128, 128)
         self.cell(0, 10, f"Página {self.page_no()}/{{nb}}", 0, 0, "C")
+# --- FIN DE LA MODIFICACIÓN ---
 
 @app.post("/analyze-documents")
 async def analyze_documents(files: List[UploadFile] = File(...), instructions: str = Form(...)):
@@ -86,13 +87,11 @@ async def analyze_documents(files: List[UploadFile] = File(...), instructions: s
         if file.content_type not in ["application/pdf", "application/msword", "application/vnd.openxmlformats-officedocument.wordprocessingml.document"]:
             raise HTTPException(status_code=400, detail=f"Tipo de archivo no soportado: {file.filename}")
         contents = await file.read()
-        # La API REST requiere que los datos de los archivos estén en base64
         encoded_contents = base64.b64encode(contents).decode("utf-8")
         file_parts.append({"inline_data": {"mime_type": file.content_type, "data": encoded_contents}})
     
     prompt_parts = [*file_parts, {"text": f"\n--- \nInstrucciones del Usuario: {instructions}"}]
 
-    # Configuración de generación
     temperature = float(os.getenv("GEMINI_TEMP", 0.3))
     top_p = float(os.getenv("GEMINI_TOP_P", 0.95))
     generation_config = {
@@ -100,7 +99,6 @@ async def analyze_documents(files: List[UploadFile] = File(...), instructions: s
         "topP": top_p
     }
 
-    # Payload para la API REST
     request_payload = {
         "contents": [{"parts": prompt_parts}],
         "systemInstruction": {"parts": [{"text": ANALYZER_SYSTEM_PROMPT}]},
@@ -110,7 +108,7 @@ async def analyze_documents(files: List[UploadFile] = File(...), instructions: s
     try:
         headers = {"Content-Type": "application/json"}
         response = requests.post(GEMINI_API_URL, headers=headers, data=json.dumps(request_payload))
-        response.raise_for_status() # Lanza un error para respuestas 4xx o 5xx
+        response.raise_for_status()
         
         response_json = response.json()
         if "candidates" in response_json and response_json["candidates"]:
@@ -119,11 +117,9 @@ async def analyze_documents(files: List[UploadFile] = File(...), instructions: s
                 analysis_text = "".join(part.get("text", "") for part in first_candidate["content"]["parts"])
                 return {"analysis": analysis_text}
         
-        # Si la respuesta no tiene el formato esperado
         raise HTTPException(status_code=500, detail=f"Respuesta inesperada de la API de Gemini: {response.text}")
 
     except requests.exceptions.HTTPError as e:
-        # Captura errores HTTP específicos para dar un mejor mensaje
         raise HTTPException(status_code=e.response.status_code, detail=f"Error de la API de Gemini: {e.response.text}")
     except requests.exceptions.RequestException as e:
         raise HTTPException(status_code=502, detail=f"Error de conexión con la API de Gemini: {str(e)}")
