@@ -3,13 +3,15 @@ import base64
 import requests
 import json
 import io
+import re
 from fastapi import FastAPI, File, Form, UploadFile, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
 from typing import List
 from dotenv import load_dotenv
 from docx import Document
-from docx.shared import Pt # Importación necesaria para definir el tamaño de la fuente en DOCX
+from docx.shared import Pt
 from fpdf import FPDF
+from markdown_it import MarkdownIt
 from datetime import datetime
 
 from src.core.prompts import ANALYZER_SYSTEM_PROMPT
@@ -34,8 +36,39 @@ app.add_middleware(
     expose_headers=["Content-Disposition"],
 )
 
-# --- CLASE PDF MODIFICADA ---
-# Se cambiaron las fuentes de "WorkSans" a "NotoSans"
+# --- INICIO: NUEVA FUNCIÓN AUXILIAR PARA DOCX ---
+def parse_and_add_markdown_to_docx(document, markdown_text):
+    """
+    Analiza un texto en Markdown y lo añade a un objeto Document de python-docx
+    con el formato correspondiente para títulos y negritas.
+    """
+    # Dividir el texto por líneas para procesar cada una
+    for line in markdown_text.strip().split('\n'):
+        # Si la línea es un título (## Texto)
+        if line.startswith('## '):
+            document.add_heading(line.lstrip('## '), level=2)
+        # Si la línea es un título (# Texto)
+        elif line.startswith('# '):
+            document.add_heading(line.lstrip('# '), level=1)
+        # Si la línea está vacía, añade un párrafo vacío para espaciado
+        elif not line.strip():
+            document.add_paragraph('')
+        # Para párrafos con texto normal y negritas
+        else:
+            p = document.add_paragraph()
+            # Divide la línea por el delimitador de negritas (**)
+            # Esto crea una lista como ['Texto normal ', 'texto en negritas', ' más texto.']
+            parts = re.split(r'(\*\*.*?\*\*)', line)
+            for part in parts:
+                if part.startswith('**') and part.endswith('**'):
+                    # Añade la parte en negritas
+                    p.add_run(part.strip('*')).bold = True
+                else:
+                    # Añade el texto normal
+                    p.add_run(part)
+# --- FIN: NUEVA FUNCIÓN AUXILIAR ---
+
+
 class PDF(FPDF):
     def header(self):
         self.add_font("NotoSans", "", "fonts/NotoSans-Regular.ttf", uni=True)
@@ -122,8 +155,6 @@ async def download_analysis(
         if file_format.lower() == "docx":
             document = Document()
             
-            # --- SECCIÓN DOCX MODIFICADA ---
-            # Establecer "Noto Sans" como la fuente por defecto para los estilos
             style = document.styles['Normal']
             font = style.font
             font.name = 'Noto Sans'
@@ -134,14 +165,19 @@ async def download_analysis(
             
             style_h2 = document.styles['Heading 2']
             style_h2.font.name = 'Noto Sans'
-            # --- FIN DE LA MODIFICACIÓN ---
 
             document.add_heading("PIDA-AI: Resumen de Consulta", level=1)
             document.add_paragraph(f"Generado: {datetime.now().strftime('%d/%m/%Y, %H:%M:%S')}")
             document.add_heading("Tu Pregunta", level=2)
             document.add_paragraph(instructions)
             document.add_heading("Respuesta de PIDA-AI", level=2)
-            document.add_paragraph(analysis_text)
+            
+            # --- SECCIÓN DOCX MODIFICADA ---
+            # Se reemplaza el simple document.add_paragraph(analysis_text)
+            # por una llamada a nuestra nueva función.
+            parse_and_add_markdown_to_docx(document, analysis_text)
+            # --- FIN DE LA MODIFICACIÓN ---
+
             document.save(file_stream)
             media_type = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
             filename = f"PIDA-AI-Analisis - {timestamp}.docx"
@@ -150,8 +186,6 @@ async def download_analysis(
             pdf.alias_nb_pages()
             pdf.add_page()
             
-            # --- SECCIÓN PDF MODIFICADA ---
-            # Se cambiaron las fuentes de "WorkSans" a "NotoSans"
             pdf.set_font("NotoSans", "B", 12)
             pdf.set_text_color(29, 53, 87)
             pdf.cell(0, 10, "Tu Pregunta", 0, 1, "L")
@@ -163,9 +197,17 @@ async def download_analysis(
             pdf.set_font("NotoSans", "B", 12)
             pdf.set_text_color(29, 53, 87)
             pdf.cell(0, 10, "Respuesta de PIDA-AI", 0, 1, "L")
+            
+            # --- SECCIÓN PDF MODIFICADA ---
+            # Convertimos el Markdown a un HTML simple y usamos el método
+            # write_html de FPDF, que sí interpreta etiquetas como <h2> y <b>.
+            md = MarkdownIt()
+            html_content = md.render(analysis_text).replace('<h2>', '<h2><font color="#1D3557">').replace('</h2>', '</font></h2>')
+            
             pdf.set_font("NotoSans", "", 11)
             pdf.set_text_color(0, 0, 0)
-            pdf.multi_cell(0, 8, analysis_text)
+            pdf.write_html(html_content)
+            # --- FIN DE LA MODIFICACIÓN ---
             
             pdf_output = pdf.output()
             file_stream.write(pdf_output)
