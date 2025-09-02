@@ -53,15 +53,11 @@ def parse_and_add_markdown_to_docx(document, markdown_text):
                 else:
                     p.add_run(part)
 
-# --- CLASE PDF MODIFICADA ---
 class PDF(FPDF):
     def header(self):
         self.add_font("NotoSans", "", "fonts/NotoSans-Regular.ttf", uni=True)
         self.add_font("NotoSans", "B", "fonts/NotoSans-Bold.ttf", uni=True)
-        # --- LÍNEA NUEVA AÑADIDA ---
-        # Registramos la fuente en cursiva (Italic)
         self.add_font("NotoSans", "I", "fonts/NotoSans-Italic.ttf", uni=True)
-        # -------------------------
         self.set_font("NotoSans", "B", 15)
         self.set_text_color(29, 53, 87)
         self.cell(0, 10, "PIDA-AI: Resumen de Consulta", 0, 1, "L")
@@ -75,20 +71,42 @@ class PDF(FPDF):
         self.set_font("NotoSans", "", 8)
         self.set_text_color(128, 128, 128)
         self.cell(0, 10, f"Página {self.page_no()}/{{nb}}", 0, 0, "C")
-# --- FIN DE LA MODIFICACIÓN ---
 
 @app.post("/analyze-documents")
 async def analyze_documents(files: List[UploadFile] = File(...), instructions: str = Form(...)):
     if len(files) > 5:
         raise HTTPException(status_code=400, detail="Se permite un máximo de 5 archivos.")
     
+    # --- INICIO DE LA MODIFICACIÓN ---
+    
+    # Definimos los tipos de archivo que SÍ aceptamos. Excluimos 'application/msword'.
+    supported_mime_types = ["application/pdf", "application/vnd.openxmlformats-officedocument.wordprocessingml.document"]
+    
     file_parts = []
     for file in files:
-        if file.content_type not in ["application/pdf", "application/msword", "application/vnd.openxmlformats-officedocument.wordprocessingml.document"]:
+        if file.content_type not in supported_mime_types:
             raise HTTPException(status_code=400, detail=f"Tipo de archivo no soportado: {file.filename}")
+        
         contents = await file.read()
-        encoded_contents = base64.b64encode(contents).decode("utf-8")
-        file_parts.append({"inline_data": {"mime_type": file.content_type, "data": encoded_contents}})
+
+        # Si el archivo es un DOCX, extraemos su texto.
+        if file.content_type == "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
+            try:
+                doc_stream = io.BytesIO(contents)
+                document = Document(doc_stream)
+                full_text = "\n".join([para.text for para in document.paragraphs])
+                
+                # Enviamos el texto extraído en lugar del archivo
+                file_parts.append({"text": f"--- INICIO DEL DOCUMENTO '{file.filename}' ---\n\n{full_text}\n\n--- FIN DEL DOCUMENTO '{file.filename}' ---"})
+            except Exception as e:
+                # Si el DOCX está corrupto o no se puede leer, lanzamos un error
+                raise HTTPException(status_code=400, detail=f"No se pudo procesar el archivo DOCX '{file.filename}': {e}")
+        else:
+            # Para PDF y otros formatos futuros, usamos el método original
+            encoded_contents = base64.b64encode(contents).decode("utf-8")
+            file_parts.append({"inline_data": {"mime_type": file.content_type, "data": encoded_contents}})
+            
+    # --- FIN DE LA MODIFICACIÓN ---
     
     prompt_parts = [*file_parts, {"text": f"\n--- \nInstrucciones del Usuario: {instructions}"}]
 
@@ -180,7 +198,7 @@ async def download_analysis(
             pdf.cell(0, 10, "Respuesta de PIDA-AI", 0, 1, "L")
             
             md = MarkdownIt()
-            html_content = md.render(analysis_text).replace('<h2>', '<h2><font color="#1D3557">').replace('</h2>', '</font></h2>')
+            html_content = md.render(analysis_text).replace('<h2>', '<h2><font color="#1D3557">').replace('</h2>', '</font></h2>').replace('<i>', '').replace('</i>', '').replace('<em>', '').replace('</em>', '')
             
             pdf.set_font("NotoSans", "", 11)
             pdf.set_text_color(0, 0, 0)
