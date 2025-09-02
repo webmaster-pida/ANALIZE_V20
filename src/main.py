@@ -8,6 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from typing import List
 from dotenv import load_dotenv
 from docx import Document
+from docx.shared import Pt # Importación necesaria para definir el tamaño de la fuente en DOCX
 from fpdf import FPDF
 from datetime import datetime
 
@@ -25,31 +26,31 @@ GEMINI_API_URL = f"https://generativelanguage.googleapis.com/v1beta/models/gemin
 
 app = FastAPI(title="PIDA Document Analyzer API")
 
-# --- BLOQUE MODIFICADO ---
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
-    # Nueva línea para exponer la cabecera del nombre de archivo
     expose_headers=["Content-Disposition"],
 )
 
+# --- CLASE PDF MODIFICADA ---
+# Se cambiaron las fuentes de "WorkSans" a "NotoSans"
 class PDF(FPDF):
     def header(self):
-        self.add_font("WorkSans", "", "fonts/WorkSans-Regular.ttf", uni=True)
-        self.add_font("WorkSans", "B", "fonts/WorkSans-Bold.ttf", uni=True)
-        self.set_font("WorkSans", "B", 15)
+        self.add_font("NotoSans", "", "fonts/NotoSans-Regular.ttf", uni=True)
+        self.add_font("NotoSans", "B", "fonts/NotoSans-Bold.ttf", uni=True)
+        self.set_font("NotoSans", "B", 15)
         self.set_text_color(29, 53, 87)
         self.cell(0, 10, "PIDA-AI: Resumen de Consulta", 0, 1, "L")
-        self.set_font("WorkSans", "", 10)
+        self.set_font("NotoSans", "", 10)
         self.set_text_color(128, 128, 128)
         self.cell(0, 10, f"Generado: {datetime.now().strftime('%d/%m/%Y, %H:%M:%S')}", 0, 1, "L")
         self.ln(5)
 
     def footer(self):
         self.set_y(-15)
-        self.set_font("WorkSans", "", 8)
+        self.set_font("NotoSans", "", 8)
         self.set_text_color(128, 128, 128)
         self.cell(0, 10, f"Página {self.page_no()}/{{nb}}", 0, 0, "C")
 
@@ -67,10 +68,8 @@ async def analyze_documents(files: List[UploadFile] = File(...), instructions: s
     
     prompt_parts = [*file_parts, {"text": f"\n--- \nInstrucciones del Usuario: {instructions}"}]
 
-    # 1. Crear el diccionario de configuración de generación
     generation_config = {}
     
-    # 2. Leer y validar la variable de entorno para la temperatura
     temp_env = os.getenv("GEMINI_TEMP")
     if temp_env:
         try:
@@ -78,7 +77,6 @@ async def analyze_documents(files: List[UploadFile] = File(...), instructions: s
         except ValueError:
             print(f"Advertencia: El valor de GEMINI_TEMP ('{temp_env}') no es un número válido. Se ignorará.")
 
-    # 3. Leer y validar la variable de entorno para el Top_P
     top_p_env = os.getenv("GEMINI_TOP_P")
     if top_p_env:
         try:
@@ -86,13 +84,11 @@ async def analyze_documents(files: List[UploadFile] = File(...), instructions: s
         except ValueError:
             print(f"Advertencia: El valor de GEMINI_TOP_P ('{top_p_env}') no es un número válido. Se ignorará.")
             
-    # 4. Construir el payload final para la API
     request_payload = {
         "contents": [{"parts": prompt_parts}],
         "systemInstruction": {"parts": [{"text": ANALYZER_SYSTEM_PROMPT}]}
     }
 
-    # 5. Añadir la configuración de generación solo si contiene valores
     if generation_config:
         request_payload["generationConfig"] = generation_config
         
@@ -125,6 +121,21 @@ async def download_analysis(
 
         if file_format.lower() == "docx":
             document = Document()
+            
+            # --- SECCIÓN DOCX MODIFICADA ---
+            # Establecer "Noto Sans" como la fuente por defecto para los estilos
+            style = document.styles['Normal']
+            font = style.font
+            font.name = 'Noto Sans'
+            font.size = Pt(11)
+
+            style_h1 = document.styles['Heading 1']
+            style_h1.font.name = 'Noto Sans'
+            
+            style_h2 = document.styles['Heading 2']
+            style_h2.font.name = 'Noto Sans'
+            # --- FIN DE LA MODIFICACIÓN ---
+
             document.add_heading("PIDA-AI: Resumen de Consulta", level=1)
             document.add_paragraph(f"Generado: {datetime.now().strftime('%d/%m/%Y, %H:%M:%S')}")
             document.add_heading("Tu Pregunta", level=2)
@@ -139,18 +150,20 @@ async def download_analysis(
             pdf.alias_nb_pages()
             pdf.add_page()
             
-            pdf.set_font("WorkSans", "B", 12)
+            # --- SECCIÓN PDF MODIFICADA ---
+            # Se cambiaron las fuentes de "WorkSans" a "NotoSans"
+            pdf.set_font("NotoSans", "B", 12)
             pdf.set_text_color(29, 53, 87)
             pdf.cell(0, 10, "Tu Pregunta", 0, 1, "L")
-            pdf.set_font("WorkSans", "", 11)
+            pdf.set_font("NotoSans", "", 11)
             pdf.set_text_color(0, 0, 0)
             pdf.multi_cell(0, 8, instructions)
             pdf.ln(10)
             
-            pdf.set_font("WorkSans", "B", 12)
+            pdf.set_font("NotoSans", "B", 12)
             pdf.set_text_color(29, 53, 87)
             pdf.cell(0, 10, "Respuesta de PIDA-AI", 0, 1, "L")
-            pdf.set_font("WorkSans", "", 11)
+            pdf.set_font("NotoSans", "", 11)
             pdf.set_text_color(0, 0, 0)
             pdf.multi_cell(0, 8, analysis_text)
             
