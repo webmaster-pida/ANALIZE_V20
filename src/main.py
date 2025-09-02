@@ -1,4 +1,5 @@
 import os
+import base64
 import requests
 import json
 import io
@@ -12,30 +13,23 @@ from docx.shared import Pt
 from fpdf import FPDF
 from markdown_it import MarkdownIt
 from datetime import datetime
-import google.generativeai as genai
 
 from src.core.prompts import ANALYZER_SYSTEM_PROMPT
 
 # Cargar variables de entorno
 load_dotenv()
 
-# --- SECCIÓN DE CONFIGURACIÓN MODIFICADA PARA EL SDK ---
+# --- SECCIÓN DE CONFIGURACIÓN VUELTA A REQUESTS ---
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-
-# --- INICIO: CÓDIGO DE DEPURACIÓN (TEMPORAL) ---
-if GEMINI_API_KEY:
-    # Imprimimos información clave para depurar sin exponer la clave completa
-    print(f"DEBUG: Verificando API Key. Longitud: {len(GEMINI_API_KEY)}, Primeros 5: '{GEMINI_API_KEY[:5]}', Últimos 5: '{GEMINI_API_KEY[-5:]}'")
-else:
-    print("DEBUG: La variable de entorno GEMINI_API_KEY no fue encontrada.")
-# --- FIN: CÓDIGO DE DEPURACIÓN ---
-
 if not GEMINI_API_KEY:
     raise ValueError("No se encontró la variable de entorno GEMINI_API_KEY")
 
-# Configura el SDK de Google
-genai.configure(api_key=GEMINI_API_KEY)
+# Modelo por defecto es gemini-2.5-flash
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 
+# Usamos v1beta para asegurar compatibilidad con systemInstruction
+GEMINI_API_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
+# --- FIN DE LA SECCIÓN ---
 
 app = FastAPI(title="PIDA Document Analyzer API")
 
@@ -86,45 +80,55 @@ class PDF(FPDF):
 async def analyze_documents(files: List[UploadFile] = File(...), instructions: str = Form(...)):
     if len(files) > 5:
         raise HTTPException(status_code=400, detail="Se permite un máximo de 5 archivos.")
-
-    # 1. Configuración del modelo y parámetros (Modelo por defecto actualizado)
-    gemini_model_name = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
-    temperature = float(os.getenv("GEMINI_TEMP", 0.3))
-    top_p = float(os.getenv("GEMINI_TOP_P", 0.95))
-
-    generation_config = genai.types.GenerationConfig(
-        temperature=temperature,
-        top_p=top_p
-    )
-
-    # 2. Prepara los archivos para el SDK
-    prompt_parts = []
+    
+    file_parts = []
     for file in files:
         if file.content_type not in ["application/pdf", "application/msword", "application/vnd.openxmlformats-officedocument.wordprocessingml.document"]:
             raise HTTPException(status_code=400, detail=f"Tipo de archivo no soportado: {file.filename}")
-        
         contents = await file.read()
-        prompt_parts.append({"mime_type": file.content_type, "data": contents})
+        # La API REST requiere que los datos de los archivos estén en base64
+        encoded_contents = base64.b64encode(contents).decode("utf-8")
+        file_parts.append({"inline_data": {"mime_type": file.content_type, "data": encoded_contents}})
+    
+    prompt_parts = [*file_parts, {"text": f"\n--- \nInstrucciones del Usuario: {instructions}"}]
 
-    # Añade las instrucciones del usuario al final
-    prompt_parts.append(instructions)
+    # Configuración de generación
+    temperature = float(os.getenv("GEMINI_TEMP", 0.3))
+    top_p = float(os.getenv("GEMINI_TOP_P", 0.95))
+    generation_config = {
+        "temperature": temperature,
+        "topP": top_p
+    }
+
+    # Payload para la API REST
+    request_payload = {
+        "contents": [{"parts": prompt_parts}],
+        "systemInstruction": {"parts": [{"text": ANALYZER_SYSTEM_PROMPT}]},
+        "generationConfig": generation_config
+    }
     
     try:
-        # 3. Inicializa el modelo con el SDK
-        model = genai.GenerativeModel(
-            model_name=gemini_model_name,
-            system_instruction=ANALYZER_SYSTEM_PROMPT,
-            generation_config=generation_config
-        )
+        headers = {"Content-Type": "application/json"}
+        response = requests.post(GEMINI_API_URL, headers=headers, data=json.dumps(request_payload))
+        response.raise_for_status() # Lanza un error para respuestas 4xx o 5xx
+        
+        response_json = response.json()
+        if "candidates" in response_json and response_json["candidates"]:
+            first_candidate = response_json["candidates"][0]
+            if "content" in first_candidate and "parts" in first_candidate["content"]:
+                analysis_text = "".join(part.get("text", "") for part in first_candidate["content"]["parts"])
+                return {"analysis": analysis_text}
+        
+        # Si la respuesta no tiene el formato esperado
+        raise HTTPException(status_code=500, detail=f"Respuesta inesperada de la API de Gemini: {response.text}")
 
-        # 4. Llama a la API a través del SDK
-        response = model.generate_content(prompt_parts)
-
-        return {"analysis": response.text}
-
+    except requests.exceptions.HTTPError as e:
+        # Captura errores HTTP específicos para dar un mejor mensaje
+        raise HTTPException(status_code=e.response.status_code, detail=f"Error de la API de Gemini: {e.response.text}")
+    except requests.exceptions.RequestException as e:
+        raise HTTPException(status_code=502, detail=f"Error de conexión con la API de Gemini: {str(e)}")
     except Exception as e:
-        # El SDK tiene sus propios errores, los capturamos y devolvemos un error genérico
-        raise HTTPException(status_code=500, detail=f"Error al procesar con la API de Gemini: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error interno del servidor: {str(e)}")
 
 
 @app.post("/download-analysis")
