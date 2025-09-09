@@ -74,8 +74,8 @@ class PDF(FPDF):
 
 @app.post("/analyze-documents")
 async def analyze_documents(files: List[UploadFile] = File(...), instructions: str = Form(...)):
-    if len(files) > 7:
-        raise HTTPException(status_code=400, detail="Se permite un máximo de 7 archivos.")
+    if len(files) > 10:
+        raise HTTPException(status_code=400, detail="Se permite un máximo de 10 archivos.")
     
     # --- INICIO DE LA MODIFICACIÓN ---
     
