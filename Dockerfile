@@ -5,8 +5,13 @@ FROM python:3.12-slim
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 
-# Establece el directorio de trabajo inicial
+# Establece el directorio de trabajo raíz de la aplicación
 WORKDIR /app
+
+# --- LA SOLUCIÓN DEFINITIVA ---
+# Añade el directorio de trabajo a la ruta de búsqueda de Python.
+# Esto garantiza que "src" sea siempre un paquete localizable.
+ENV PYTHONPATH=/app
 
 # Crea un usuario no-root por seguridad
 RUN addgroup --system app && adduser --system --group app
@@ -21,11 +26,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copia todo el código de tu proyecto al contenedor
 COPY . .
 
-# --- CAMBIO CLAVE #1: Mueve el directorio de trabajo a la carpeta del código ---
-WORKDIR /app/src
-
-# Dale la propiedad de TODOS los archivos al usuario no-root
-# Nota: Usamos /app para que la propiedad se aplique a todo
+# Dale la propiedad de los archivos al usuario no-root
 RUN chown -R app:app /app
 
 # Cambia al usuario no-root
@@ -34,5 +35,5 @@ USER app
 # Expone el puerto que usa Cloud Run
 EXPOSE 8080
 
-# --- CAMBIO CLAVE #2: Comando simplificado que se ejecuta DESDE /app/src ---
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8080"]
+# El comando de inicio estándar. Gracias al PYTHONPATH, esto ahora funcionará.
+CMD ["uvicorn", "src.main:app", "--host", "0.0.0.0", "--port", "8080"]
