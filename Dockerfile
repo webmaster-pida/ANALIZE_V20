@@ -1,17 +1,12 @@
 # Usa una imagen base de Python 3.12 oficial y ligera
 FROM python:3.12-slim
 
-# Variables de entorno para optimizar Python en contenedores
+# Variables de entorno para optimizar Python
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 
-# Establece el directorio de trabajo raíz de la aplicación
+# Establece el directorio de trabajo
 WORKDIR /app
-
-# --- LA SOLUCIÓN DEFINITIVA ---
-# Añade el directorio de trabajo a la ruta de búsqueda de Python.
-# Esto garantiza que "src" sea siempre un paquete localizable.
-ENV PYTHONPATH=/app
 
 # Crea un usuario no-root por seguridad
 RUN addgroup --system app && adduser --system --group app
@@ -23,8 +18,13 @@ RUN pip install --upgrade pip
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copia todo el código de tu proyecto al contenedor
-COPY . .
+# --- EL CAMBIO FUNDAMENTAL ---
+# Copia el CONTENIDO de la carpeta 'src' a /app.
+# Ahora main.py y la carpeta 'core' estarán en /app.
+COPY ./src/ .
+
+# Copia las fuentes a una carpeta 'fonts' dentro de /app
+COPY ./fonts/ ./fonts/
 
 # Dale la propiedad de los archivos al usuario no-root
 RUN chown -R app:app /app
@@ -35,5 +35,6 @@ USER app
 # Expone el puerto que usa Cloud Run
 EXPOSE 8080
 
-# El comando de inicio estándar. Gracias al PYTHONPATH, esto ahora funcionará.
-CMD ["uvicorn", "src.main:app", "--host", "0.0.0.0", "--port", "8080"]
+# --- EL COMANDO SIMPLIFICADO ---
+# Como main.py está ahora en /app, el comando es directo.
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8080"]
