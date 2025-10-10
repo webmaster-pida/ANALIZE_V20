@@ -16,9 +16,9 @@ from fpdf import FPDF
 from markdown_it import MarkdownIt
 from datetime import datetime
 
-# --- LÍNEAS CORREGIDAS CON IMPORTACIONES DIRECTAS DESDE /app/src ---
-from core.security import get_current_user
-from core.prompts import ANALYZER_SYSTEM_PROMPT
+# --- LÍNEAS CORREGIDAS CON IMPORTACIONES ABSOLUTAS ---
+from src.core.security import get_current_user
+from src.core.prompts import ANALYZER_SYSTEM_PROMPT
 
 # Cargar variables de entorno
 load_dotenv()
