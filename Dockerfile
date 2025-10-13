@@ -9,10 +9,22 @@ ENV PYTHONUNBUFFERED=1
 WORKDIR /app
 
 # Añade el directorio de trabajo a la ruta de búsqueda de Python.
-# Esto garantiza que "src" sea siempre un paquete localizable.
 ENV PYTHONPATH=/app
 
-# Crea un usuario no-root por seguridad
+# --- INICIO DE LA MODIFICACIÓN ---
+# Instala las dependencias del sistema operativo ANTES de cualquier otra operación.
+# Esto se ejecuta como root y es crucial para que pip pueda instalar paquetes
+# complejos como PyMuPDF de forma rápida y sin errores.
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    pkg-config \
+    swig \
+    libffi-dev \
+    --no-install-recommends && \
+    rm -rf /var/lib/apt/lists/*
+# --- FIN DE LA MODIFICACIÓN ---
+
+# Crea un usuario no-root por seguridad (Tu código original, se mantiene)
 RUN addgroup --system app && adduser --system --group app
 
 # Actualiza pip
@@ -34,5 +46,5 @@ USER app
 # Expone el puerto que usa Cloud Run
 EXPOSE 8080
 
-# El comando de inicio estándar. Gracias al PYTHONPATH, esto ahora funcionará.
+# El comando de inicio estándar.
 CMD ["uvicorn", "src.main:app", "--host", "0.0.0.0", "--port", "8080"]
