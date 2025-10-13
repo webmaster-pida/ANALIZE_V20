@@ -6,3 +6,4 @@ python-docx
 fpdf2
 markdown-it-py
 firebase-admin
+python-multipart
