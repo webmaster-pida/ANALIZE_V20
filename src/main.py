@@ -1,4 +1,4 @@
-# iiresodh-cr/pida-analizador-firebase/PIDA-Analizador-Firebase-67be5ff9100701269c8f54a3f74472d282a8351a/src/main.py
+# /src/main.py
 
 import os
 import base64
@@ -15,6 +15,9 @@ from docx.shared import Pt
 from fpdf import FPDF
 from markdown_it import MarkdownIt
 from datetime import datetime
+# --- INICIO MODIFICACIÓN: AÑADIR LIBRERÍA FIRESTORE ---
+from google.cloud import firestore
+# --- FIN MODIFICACIÓN ---
 
 from src.core.security import get_current_user
 from src.core.prompts import ANALYZER_SYSTEM_PROMPT
@@ -28,6 +31,10 @@ if not GEMINI_API_KEY:
 
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-flash") # Modelo actualizado
 GEMINI_API_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
+
+# --- INICIO MODIFICACIÓN: INICIALIZAR FIRESTORE ---
+db = firestore.Client()
+# --- FIN MODIFICACIÓN ---
 
 app = FastAPI(title="PIDA Document Analyzer API")
 
@@ -91,21 +98,22 @@ class PDF(FPDF):
 
 @app.post("/analyze/")
 async def analyze_documents(
-    files: List[UploadFile] = File(...), 
+    files: List[UploadFile] = File(...),
     instructions: str = Form(...),
     current_user: Dict[str, Any] = Depends(get_current_user)
 ):
     print(f"Petición de análisis recibida del usuario UID: {current_user.get('uid')}")
     if len(files) > 3:
         raise HTTPException(status_code=400, detail="Se permite un máximo de 3 archivos.")
-    
+
     supported_mime_types = ["application/pdf", "application/vnd.openxmlformats-officedocument.wordprocessingml.document"]
-    
+
     file_parts = []
+    original_filenames = [file.filename for file in files]
     for file in files:
         if file.content_type not in supported_mime_types:
             raise HTTPException(status_code=400, detail=f"Tipo de archivo no soportado: {file.filename}")
-        
+
         contents = await file.read()
 
         if file.content_type == "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
@@ -119,7 +127,7 @@ async def analyze_documents(
         else:
             encoded_contents = base64.b64encode(contents).decode("utf-8")
             file_parts.append({"inline_data": {"mime_type": file.content_type, "data": encoded_contents}})
-            
+
     prompt_parts = [*file_parts, {"text": f"\n--- \nInstrucciones del Usuario: {instructions}"}]
 
     temperature = float(os.getenv("GEMINI_TEMP", 0.3))
@@ -131,19 +139,34 @@ async def analyze_documents(
         "systemInstruction": {"parts": [{"text": ANALYZER_SYSTEM_PROMPT}]},
         "generationConfig": generation_config
     }
-    
+
     try:
         headers = {"Content-Type": "application/json"}
         response = requests.post(GEMINI_API_URL, headers=headers, data=json.dumps(request_payload))
         response.raise_for_status()
-        
+
         response_json = response.json()
         if "candidates" in response_json and response_json["candidates"]:
             first_candidate = response_json["candidates"][0]
             if "content" in first_candidate and "parts" in first_candidate["content"]:
                 analysis_text = "".join(part.get("text", "") for part in first_candidate["content"]["parts"])
-                return {"analysis": analysis_text}
-        
+
+                # --- INICIO MODIFICACIÓN: GUARDAR ANÁLISIS EN FIRESTORE ---
+                user_id = current_user.get("uid")
+                title = instructions[:40] + '...' if len(instructions) > 40 else instructions
+                doc_ref = db.collection("analysis_history").document()
+                doc_ref.set({
+                    "userId": user_id,
+                    "title": title,
+                    "instructions": instructions,
+                    "analysis": analysis_text,
+                    "timestamp": firestore.SERVER_TIMESTAMP,
+                    "original_filenames": original_filenames
+                })
+                # --- FIN MODIFICACIÓN ---
+                
+                return {"analysis": analysis_text, "analysis_id": doc_ref.id}
+
         raise HTTPException(status_code=500, detail=f"Respuesta inesperada de la API de Gemini: {response.text}")
 
     except requests.exceptions.HTTPError as e:
@@ -152,6 +175,56 @@ async def analyze_documents(
         raise HTTPException(status_code=502, detail=f"Error de conexión con la API de Gemini: {str(e)}")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error interno del servidor: {str(e)}")
+
+
+# --- INICIO MODIFICACIÓN: NUEVOS ENDPOINTS PARA EL HISTORIAL ---
+
+@app.get("/analysis-history/")
+async def get_analysis_history(current_user: Dict[str, Any] = Depends(get_current_user)):
+    user_id = current_user.get("uid")
+    history_ref = db.collection("analysis_history").where("userId", "==", user_id).order_by("timestamp", direction=firestore.Query.DESCENDING)
+    docs = history_ref.stream()
+    history = []
+    for doc in docs:
+        doc_data = doc.to_dict()
+        history.append({
+            "id": doc.id,
+            "title": doc_data.get("title"),
+            "timestamp": doc_data.get("timestamp")
+        })
+    return history
+
+@app.get("/analysis-history/{analysis_id}")
+async def get_analysis_detail(analysis_id: str, current_user: Dict[str, Any] = Depends(get_current_user)):
+    user_id = current_user.get("uid")
+    doc_ref = db.collection("analysis_history").document(analysis_id)
+    doc = doc_ref.get()
+
+    if not doc.exists:
+        raise HTTPException(status_code=404, detail="Análisis no encontrado.")
+
+    doc_data = doc.to_dict()
+    if doc_data.get("userId") != user_id:
+        raise HTTPException(status_code=403, detail="No tienes permiso para acceder a este análisis.")
+
+    return doc_data
+
+@app.delete("/analysis-history/{analysis_id}")
+async def delete_analysis(analysis_id: str, current_user: Dict[str, Any] = Depends(get_current_user)):
+    user_id = current_user.get("uid")
+    doc_ref = db.collection("analysis_history").document(analysis_id)
+    doc = doc_ref.get()
+
+    if not doc.exists:
+        raise HTTPException(status_code=404, detail="Análisis no encontrado.")
+
+    if doc.to_dict().get("userId") != user_id:
+        raise HTTPException(status_code=403, detail="No tienes permiso para eliminar este análisis.")
+
+    doc_ref.delete()
+    return {"status": "ok", "message": "Análisis eliminado correctamente."}
+
+# --- FIN MODIFICACIÓN ---
 
 
 @app.post("/download-analysis")
@@ -180,7 +253,7 @@ async def download_analysis(
             document.add_heading("Tu Pregunta", level=2)
             document.add_paragraph(instructions)
             document.add_heading("Respuesta de PIDA-AI", level=2)
-            
+
             parse_and_add_markdown_to_docx(document, analysis_text)
 
             document.save(file_stream)
@@ -190,7 +263,7 @@ async def download_analysis(
             pdf = PDF()
             pdf.alias_nb_pages()
             pdf.add_page()
-            
+
             pdf.set_font("NotoSans", "B", 12)
             pdf.set_text_color(29, 53, 87)
             pdf.cell(0, 10, "Tu Pregunta", 0, 1, "L")
@@ -198,18 +271,18 @@ async def download_analysis(
             pdf.set_text_color(0, 0, 0)
             pdf.multi_cell(0, 8, instructions)
             pdf.ln(10)
-            
+
             pdf.set_font("NotoSans", "B", 12)
             pdf.set_text_color(29, 53, 87)
             pdf.cell(0, 10, "Respuesta de PIDA-AI", 0, 1, "L")
-            
+
             md = MarkdownIt()
             html_content = md.render(analysis_text)
-            
+
             pdf.set_font("NotoSans", "", 11)
             pdf.set_text_color(0, 0, 0)
             pdf.write_html(html_content)
-            
+
             pdf_output = pdf.output(dest='S').encode('latin1')
             file_stream.write(pdf_output)
             media_type = "application/pdf"
