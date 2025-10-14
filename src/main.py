@@ -54,11 +54,21 @@ app.add_middleware(
 
 # --- INICIO DE LA MODIFICACIÓN: FUNCIÓN DE VERIFICACIÓN DE SUSCRIPCIÓN ---
 
-def verify_active_subscription(user_id: str):
+def verify_active_subscription(current_user: Dict[str, Any]):
     """
-    Verifica en Firestore si un usuario tiene una suscripción activa o en período de prueba.
-    Lanza una excepción HTTP 403 si no se encuentra ninguna suscripción válida.
+    Verifica la suscripción de un usuario.
+    Si el email del usuario termina en '@iiresodh.org', se le concede acceso.
+    Para el resto, verifica en Firestore si tienen una suscripción activa o en período de prueba.
     """
+    user_id = current_user.get("uid")
+    user_email = current_user.get("email", "").lower()
+
+    # Bypass para el equipo interno
+    if user_email.endswith("@iiresodh.org"):
+        print(f"Acceso de equipo concedido para el usuario {user_email}.")
+        return
+
+    # Verificación estándar para clientes
     try:
         subscriptions_ref = db.collection("customers").document(user_id).collection("subscriptions")
         query = subscriptions_ref.where("status", "in", ["active", "trialing"]).limit(1)
@@ -67,7 +77,7 @@ def verify_active_subscription(user_id: str):
         if not results:
             raise HTTPException(status_code=403, detail="No tienes una suscripción activa o un período de prueba para usar esta función.")
         
-        print(f"Acceso verificado para el usuario {user_id}. Estado de suscripción: {results[0].to_dict().get('status')}")
+        print(f"Acceso de cliente verificado para el usuario {user_id}. Estado: {results[0].to_dict().get('status')}")
 
     except HTTPException as http_exc:
         raise http_exc
@@ -97,8 +107,6 @@ def parse_and_add_markdown_to_docx(document, markdown_text):
 
 class PDF(FPDF):
     def header(self):
-        # Asegúrate de que la carpeta 'fonts' y los archivos .ttf estén presentes
-        # en la raíz de tu servicio o ajusta la ruta.
         try:
             self.add_font("NotoSans", "", "fonts/NotoSans-Regular.ttf", uni=True)
             self.add_font("NotoSans", "B", "fonts/NotoSans-Bold.ttf", uni=True)
@@ -127,11 +135,10 @@ async def analyze_documents(
     instructions: str = Form(...),
     current_user: Dict[str, Any] = Depends(get_current_user)
 ):
-    user_id = current_user.get('uid')
-    print(f"Petición de análisis recibida del usuario UID: {user_id}")
+    print(f"Petición de análisis recibida del usuario UID: {current_user.get('uid')}")
     
     # --- INICIO DE LA MODIFICACIÓN: AÑADIR VERIFICACIÓN ---
-    verify_active_subscription(user_id)
+    verify_active_subscription(current_user)
     # --- FIN DE LA MODIFICACIÓN ---
     
     if len(files) > 3:
@@ -182,6 +189,7 @@ async def analyze_documents(
             if "content" in first_candidate and "parts" in first_candidate["content"]:
                 analysis_text = "".join(part.get("text", "") for part in first_candidate["content"]["parts"])
 
+                user_id = current_user.get("uid")
                 title = instructions[:40] + '...' if len(instructions) > 40 else instructions
                 doc_ref = db.collection("analysis_history").document()
                 doc_ref.set({
@@ -207,8 +215,8 @@ async def analyze_documents(
 
 @app.get("/analysis-history/")
 async def get_analysis_history(current_user: Dict[str, Any] = Depends(get_current_user)):
+    verify_active_subscription(current_user)
     user_id = current_user.get("uid")
-    verify_active_subscription(user_id) # Verificación
     history_ref = db.collection("analysis_history").where("userId", "==", user_id).order_by("timestamp", direction=firestore.Query.DESCENDING)
     docs = history_ref.stream()
     history = []
@@ -223,8 +231,8 @@ async def get_analysis_history(current_user: Dict[str, Any] = Depends(get_curren
 
 @app.get("/analysis-history/{analysis_id}")
 async def get_analysis_detail(analysis_id: str, current_user: Dict[str, Any] = Depends(get_current_user)):
+    verify_active_subscription(current_user)
     user_id = current_user.get("uid")
-    verify_active_subscription(user_id) # Verificación
     doc_ref = db.collection("analysis_history").document(analysis_id)
     doc = doc_ref.get()
 
@@ -239,8 +247,8 @@ async def get_analysis_detail(analysis_id: str, current_user: Dict[str, Any] = D
 
 @app.delete("/analysis-history/{analysis_id}")
 async def delete_analysis(analysis_id: str, current_user: Dict[str, Any] = Depends(get_current_user)):
+    verify_active_subscription(current_user)
     user_id = current_user.get("uid")
-    verify_active_subscription(user_id) # Verificación
     doc_ref = db.collection("analysis_history").document(analysis_id)
     doc = doc_ref.get()
 
@@ -261,11 +269,10 @@ async def download_analysis(
     file_format: str = Form("docx"),
     current_user: Dict[str, Any] = Depends(get_current_user)
 ):
-    user_id = current_user.get('uid')
-    print(f"Petición de descarga recibida del usuario UID: {user_id}")
+    print(f"Petición de descarga recibida del usuario UID: {current_user.get('uid')}")
     
-    verify_active_subscription(user_id) # Verificación
-
+    verify_active_subscription(current_user)
+    
     try:
         timestamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
         file_stream = io.BytesIO()
