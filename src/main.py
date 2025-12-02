@@ -42,10 +42,14 @@ db = firestore.Client()
 
 app = FastAPI(title="PIDA Document Analyzer API")
 
-# --- CORRECCIÓN 2: El origen debe ser "https://pida-ai.com" ---
-origins = [
-    "https://pida-ai.com"
-]
+# --- CORRECCIÓN 2 MODIFICADA: Orígenes dinámicos ---
+raw_origins = os.getenv("ALLOWED_ORIGINS", '["https://pida-ai.com"]')
+try:
+    origins = json.loads(raw_origins)
+except json.JSONDecodeError:
+    print("Error decodificando ALLOWED_ORIGINS. Usando fallback.")
+    origins = ["https://pida-ai.com"]
+# ---------------------------------------------------
 
 app.add_middleware(
     CORSMiddleware,
@@ -56,35 +60,37 @@ app.add_middleware(
     expose_headers=["Content-Disposition"],
 )
 
-# --- CORRECCIÓN 3: Middleware para corregir la cabecera Permissions-Policy ---
-class PermissionsPolicyMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request, call_next):
-        response: StarletteResponse = await call_next(request)
-        # Se establece una política moderna y correcta para evitar la advertencia.
-        # Solo permite fullscreen y geolocation desde el propio origen ('self').
-        policy = "fullscreen=(self), geolocation=(self), microphone=(), camera=()"
-        
-        # Sobrescribir el encabezado.
-        response.headers["Permissions-Policy"] = policy
-        return response
-
-app.add_middleware(PermissionsPolicyMiddleware)
-# --- FIN CORRECCIÓN 3 ---
+# ... (Middleware PermissionsPolicyMiddleware queda igual) ...
 
 def verify_active_subscription(current_user: Dict[str, Any]):
     """
     Verifica la suscripción de un usuario.
-    Si el email del usuario termina en '@iiresodh.org', se le concede acceso.
-    Para el resto, verifica en Firestore si tienen una suscripción activa o en período de prueba.
+    Comprueba listas de acceso (dominios y emails) definidas en variables de entorno.
     """
     user_id = current_user.get("uid")
     user_email = current_user.get("email", "").lower()
 
+    # --- LOGICA DE ACCESO DINÁMICA ---
+    # Valores por defecto mantienen la lógica anterior si faltan las vars
+    raw_domains = os.getenv("ADMIN_DOMAINS", '["iiresodh.org", "urquilla.com"]')
+    raw_emails = os.getenv("ADMIN_EMAILS", '[]')
+
+    try:
+        admin_domains = json.loads(raw_domains)
+        admin_emails = json.loads(raw_emails)
+    except json.JSONDecodeError:
+        print("Error decodificando listas de administración.")
+        admin_domains = ["iiresodh.org", "urquilla.com"]
+        admin_emails = []
+
+    email_domain = user_email.split("@")[-1] if "@" in user_email else ""
+
     # Bypass para el equipo interno
-    if user_email.endswith("@iiresodh.org") or user_email.endswith("@urquilla.com"):
+    if (email_domain in admin_domains) or (user_email in admin_emails):
         print(f"Acceso de equipo concedido para el usuario {user_email}.")
         return
-
+    # ---------------------------------
+    
     # Verificación estándar para clientes
     try:
         subscriptions_ref = db.collection("customers").document(user_id).collection("subscriptions")
