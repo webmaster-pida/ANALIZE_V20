@@ -1,10 +1,11 @@
 fastapi
-uvicorn[standard]
+uvicorn
+python-multipart
+python-docx
+fpdf
+markdown-it-py
+google-cloud-firestore
+google-cloud-aiplatform
 python-dotenv
 httpx
-python-docx
-fpdf2
-markdown-it-py
 firebase-admin
-python-multipart
-google-cloud-firestore
