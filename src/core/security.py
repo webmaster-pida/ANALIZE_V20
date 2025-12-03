@@ -8,8 +8,7 @@ from firebase_admin import credentials, auth
 from fastapi import Request, Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer
 
-# --- Configuración de Logging (Autónoma) ---
-# Al no tener src.config, configuramos un logger básico aquí mismo
+# Configuración básica de logs
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("pida-security")
 
@@ -25,8 +24,8 @@ oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
 # --- EL PORTERO ---
 async def get_current_user(request: Request):
     """
-    Dependencia para verificar el token de Firebase ID.
-    Lee ADMIN_DOMAINS y ADMIN_EMAILS directamente de las variables de entorno.
+    Verifica el token y aplica reglas de seguridad (Dominios y Emails)
+    leyendo directamente de las variables de entorno.
     """
     auth_header = request.headers.get("Authorization")
     if not auth_header or not auth_header.startswith("Bearer "):
@@ -38,28 +37,26 @@ async def get_current_user(request: Request):
     token = auth_header.split("Bearer ")[1]
     
     try:
-        # 1. Verificar token
+        # 1. Verificar firma del token
         decoded_token = auth.verify_id_token(token)
         
-        # 2. Obtener datos
+        # 2. Obtener datos del usuario
         email = decoded_token.get("email", "").lower()
         domain = email.split("@")[1] if "@" in email else ""
         
-        # 3. Leer configuración directamente del Entorno (Sin depender de src.config)
-        # Usamos valores por defecto vacíos '[]' para evitar errores si no están configuradas
+        # 3. Leer reglas directamente del Entorno (Sin src.config)
         raw_domains = os.getenv("ADMIN_DOMAINS", '[]')
         raw_emails = os.getenv("ADMIN_EMAILS", '[]')
 
         try:
             allowed_domains = json.loads(raw_domains)
-            # Normalizamos emails a minúsculas para comparar bien
             allowed_emails = [e.lower() for e in json.loads(raw_emails)]
         except Exception as e:
-            log.error(f"Error al procesar variables de entorno de seguridad: {e}")
+            log.error(f"Error procesando reglas de seguridad: {e}")
             allowed_domains = []
             allowed_emails = []
 
-        # 4. Lógica de Seguridad
+        # 4. Aplicar filtro si existen reglas
         has_restrictions = bool(allowed_domains or allowed_emails)
         
         if has_restrictions:
@@ -67,10 +64,10 @@ async def get_current_user(request: Request):
             is_email_authorized = email in allowed_emails
             
             if not (is_domain_authorized or is_email_authorized):
-                log.warning(f"ACCESO DENEGADO: {email} no está en listas autorizadas.")
+                log.warning(f"ACCESO DENEGADO: {email}")
                 raise HTTPException(
                     status_code=status.HTTP_403_FORBIDDEN,
-                    detail="No tienes autorización para usar el analizador."
+                    detail="No tienes autorización para usar este servicio."
                 )
 
         return decoded_token
@@ -82,5 +79,5 @@ async def get_current_user(request: Request):
     except HTTPException as he:
         raise he
     except Exception as e:
-        log.error(f"Error de autenticación: {e}", exc_info=True)
+        log.error(f"Error de autenticación: {e}")
         raise HTTPException(status_code=500, detail="Error de seguridad interno.")
