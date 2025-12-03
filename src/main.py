@@ -5,8 +5,11 @@ import base64
 import json
 import io
 import re
+import asyncio
 from fastapi import FastAPI, File, Form, UploadFile, HTTPException, Response, Depends
 from fastapi.middleware.cors import CORSMiddleware
+# Importamos StreamingResponse para el efecto "poco a poco"
+from fastapi.responses import StreamingResponse 
 from typing import List, Dict, Any
 from dotenv import load_dotenv
 from docx import Document
@@ -17,41 +20,37 @@ from datetime import datetime
 from google.cloud import firestore
 import google.auth
 
-# --- NUEVO: VERTEX AI SDK ---
+# --- VERTEX AI SDK ---
 import vertexai
 from vertexai.generative_models import GenerativeModel, Part, SafetySetting
 
 from src.core.security import get_current_user
 from src.core.prompts import ANALYZER_SYSTEM_PROMPT
 
-# Cargar variables de entorno locales
+# Cargar variables
 load_dotenv()
 
 # --- CONFIGURACIÓN VERTEX AI ---
 try:
-    # Intentar obtener credenciales y proyecto por defecto
     _, project_id_default = google.auth.default()
     PROJECT_ID = os.getenv("PROJECT_ID", project_id_default)
 except:
     PROJECT_ID = os.getenv("PROJECT_ID")
 
 LOCATION = os.getenv("GOOGLE_CLOUD_LOCATION", "us-central1")
-# En Vertex, usamos el nombre del modelo sin 'v1beta'
 GEMINI_MODEL_NAME = os.getenv("GEMINI_MODEL", "gemini-1.5-flash-001").strip()
 
 if PROJECT_ID:
     try:
         vertexai.init(project=PROJECT_ID, location=LOCATION)
-        print(f"Vertex AI inicializado correctamente: {PROJECT_ID} / {LOCATION}")
+        print(f"Vertex AI inicializado: {PROJECT_ID}")
     except Exception as e:
-        print(f"Error inicializando Vertex AI: {e}")
-else:
-    print("ADVERTENCIA: No se encontró PROJECT_ID. Vertex AI fallará.")
+        print(f"Error Vertex AI: {e}")
 
 # Inicializar Firestore
 db = firestore.Client(project=PROJECT_ID)
 
-app = FastAPI(title="PIDA Document Analyzer (Vertex)")
+app = FastAPI(title="PIDA Document Analyzer (Streaming)")
 
 # --- CORS ---
 raw_origins = os.getenv("ALLOWED_ORIGINS", '["https://pida-ai.com"]')
@@ -69,10 +68,8 @@ app.add_middleware(
     expose_headers=["Content-Disposition"],
 )
 
-# --- LÓGICA DE SUSCRIPCIÓN (Simplificada para confiar en Security.py) ---
+# --- UTILIDADES ---
 def verify_active_subscription(current_user: Dict[str, Any]):
-    # Si el usuario pasó el filtro de seguridad (Dominio/Email Admin), no verificamos suscripción.
-    # Esta función se mantiene por si en el futuro quieres cobrar a usuarios externos.
     pass 
 
 def parse_and_add_markdown_to_docx(document, markdown_text):
@@ -113,23 +110,23 @@ class PDF(FPDF):
         self.set_text_color(128, 128, 128)
         self.cell(0, 10, f"Página {self.page_no()}/{{nb}}", 0, 0, "C")
 
-# --- ENDPOINTS ---
-
+# --- ENDPOINT STREAMING ---
 @app.post("/analyze/")
 async def analyze_documents(
     files: List[UploadFile] = File(...),
     instructions: str = Form(...),
     current_user: Dict[str, Any] = Depends(get_current_user)
 ):
-    print(f"Análisis (Vertex) solicitado por: {current_user.get('email')}")
+    print(f"Análisis (Streaming) solicitado por: {current_user.get('email')}")
     
     if len(files) > 3:
-        raise HTTPException(status_code=400, detail="Máximo 3 archivos permitidos.")
+        raise HTTPException(status_code=400, detail="Máximo 3 archivos.")
 
     supported_types = ["application/pdf", "application/vnd.openxmlformats-officedocument.wordprocessingml.document"]
     model_parts = []
     original_filenames = []
 
+    # 1. Procesar archivos (Leemos en memoria antes de empezar el stream)
     for file in files:
         if file.content_type not in supported_types:
             raise HTTPException(status_code=400, detail=f"Formato no soportado: {file.filename}")
@@ -138,82 +135,89 @@ async def analyze_documents(
         content = await file.read()
 
         if file.content_type == "application/pdf":
-            # Vertex recibe el PDF binario directamente
             part = Part.from_data(data=content, mime_type="application/pdf")
             model_parts.append(part)
         else:
-            # DOCX a texto
             try:
                 doc = Document(io.BytesIO(content))
                 text = "\n".join([p.text for p in doc.paragraphs])
                 model_parts.append(f"--- DOC: {file.filename} ---\n{text}\n------\n")
-            except Exception as e:
-                raise HTTPException(status_code=400, detail=f"Error leyendo DOCX {file.filename}: {e}")
+            except:
+                raise HTTPException(status_code=400, detail=f"Error leyendo DOCX {file.filename}")
 
     model_parts.append(f"\nINSTRUCCIONES: {instructions}")
 
-    try:
-        model = GenerativeModel(
-            model_name=GEMINI_MODEL_NAME,
-            system_instruction=ANALYZER_SYSTEM_PROMPT
-        )
-        
-        # Configuración de seguridad laxa para documentos legales/técnicos
-        safety = [
-            SafetySetting(
-                category=SafetySetting.HarmCategory.HARM_CATEGORY_HATE_SPEECH,
-                threshold=SafetySetting.HarmBlockThreshold.BLOCK_ONLY_HIGH
-            ),
-            SafetySetting(
-                category=SafetySetting.HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT,
-                threshold=SafetySetting.HarmBlockThreshold.BLOCK_ONLY_HIGH
-            ),
-            SafetySetting(
-                category=SafetySetting.HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT,
-                threshold=SafetySetting.HarmBlockThreshold.BLOCK_ONLY_HIGH
-            ),
-            SafetySetting(
-                category=SafetySetting.HarmCategory.HARM_CATEGORY_HARASSMENT,
-                threshold=SafetySetting.HarmBlockThreshold.BLOCK_ONLY_HIGH
-            ),
-        ]
+    # 2. Configurar Modelo
+    model = GenerativeModel(
+        model_name=GEMINI_MODEL_NAME,
+        system_instruction=ANALYZER_SYSTEM_PROMPT
+    )
+    
+    safety = [
+        SafetySetting(
+            category=SafetySetting.HarmCategory.HARM_CATEGORY_HATE_SPEECH,
+            threshold=SafetySetting.HarmBlockThreshold.BLOCK_ONLY_HIGH
+        ),
+        SafetySetting(
+            category=SafetySetting.HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT,
+            threshold=SafetySetting.HarmBlockThreshold.BLOCK_ONLY_HIGH
+        ),
+        SafetySetting(
+            category=SafetySetting.HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT,
+            threshold=SafetySetting.HarmBlockThreshold.BLOCK_ONLY_HIGH
+        ),
+        SafetySetting(
+            category=SafetySetting.HarmCategory.HARM_CATEGORY_HARASSMENT,
+            threshold=SafetySetting.HarmBlockThreshold.BLOCK_ONLY_HIGH
+        ),
+    ]
 
-        # Llamada a Vertex AI
-        responses = model.generate_content(
-            model_parts,
-            generation_config={"temperature": 0.3, "max_output_tokens": 8192},
-            safety_settings=safety,
-            stream=False
-        )
-        
-        analysis_text = responses.text
+    # 3. Generador Asíncrono para Streaming
+    async def generate_stream():
+        full_text = ""
+        try:
+            # Usamos generate_content_async con stream=True
+            responses = await model.generate_content_async(
+                model_parts,
+                generation_config={"temperature": 0.3, "max_output_tokens": 8192},
+                safety_settings=safety,
+                stream=True
+            )
 
-        # Guardar en Firestore
-        doc_ref = db.collection("analysis_history").document()
-        doc_ref.set({
-            "userId": current_user.get("uid"),
-            "title": (instructions[:40] + '...') if len(instructions) > 40 else instructions,
-            "instructions": instructions,
-            "analysis": analysis_text,
-            "timestamp": firestore.SERVER_TIMESTAMP,
-            "original_filenames": original_filenames
-        })
+            async for chunk in responses:
+                if chunk.text:
+                    full_text += chunk.text
+                    # Enviamos formato SSE (Server-Sent Events)
+                    yield f"data: {json.dumps({'text': chunk.text})}\n\n"
+            
+            # Al terminar, guardamos en Firestore
+            user_id = current_user.get("uid")
+            title = (instructions[:40] + '...') if len(instructions) > 40 else instructions
+            
+            doc_ref = db.collection("analysis_history").document()
+            doc_ref.set({
+                "userId": user_id,
+                "title": title,
+                "instructions": instructions,
+                "analysis": full_text,
+                "timestamp": firestore.SERVER_TIMESTAMP,
+                "original_filenames": original_filenames
+            })
+            
+            # Enviamos señal de fin con el ID del análisis
+            yield f"data: {json.dumps({'done': True, 'analysis_id': doc_ref.id})}\n\n"
 
-        return {"analysis": analysis_text, "analysis_id": doc_ref.id}
+        except Exception as e:
+            print(f"Error en stream: {e}")
+            yield f"data: {json.dumps({'error': str(e)})}\n\n"
 
-    except Exception as e:
-        print(f"Error Vertex AI: {e}")
-        msg = str(e)
-        if "403" in msg or "PermissionDenied" in msg:
-            raise HTTPException(status_code=500, detail="Error de permisos en Vertex AI. Verifica la API en GCP.")
-        if "429" in msg or "ResourceExhausted" in msg:
-            raise HTTPException(status_code=503, detail="Cuota de IA excedida, intenta más tarde.")
-        raise HTTPException(status_code=500, detail=f"Error al analizar: {msg}")
+    # Retornamos la respuesta como un stream de eventos
+    return StreamingResponse(generate_stream(), media_type="text/event-stream")
 
+# ... (Resto de endpoints GET, DELETE, DOWNLOAD siguen igual) ...
 @app.get("/analysis-history/")
 async def get_analysis_history(current_user: Dict[str, Any] = Depends(get_current_user)):
     user_id = current_user.get("uid")
-    # Requiere el índice compuesto que ya creaste
     ref = db.collection("analysis_history").where("userId", "==", user_id).order_by("timestamp", direction=firestore.Query.DESCENDING)
     return [{"id": d.id, "title": d.get("title"), "timestamp": d.get("timestamp")} for d in ref.stream()]
 
@@ -288,4 +292,4 @@ async def download_analysis(
 
 @app.get("/")
 def read_root():
-    return {"status": "ok", "msg": "Analizador Vertex Activo"}
+    return {"status": "ok", "msg": "Analizador Vertex Activo (Streaming)"}
