@@ -91,7 +91,7 @@ def parse_and_add_markdown_to_docx(document, markdown_text):
 
 class PDF(FPDF):
     def header(self):
-        # MODIFICADO: Solo usar Arial (fuente estándar FPDF)
+        # Usando Arial (fuente estándar FPDF)
         self.set_font("Arial", "B", 15)
         self.set_text_color(29, 53, 87)
         self.cell(0, 10, "PIDA-AI: Resumen de Consulta", 0, 1, "L")
@@ -137,41 +137,34 @@ def create_pdf_sync(analysis_text: str, instructions: str, timestamp: str) -> tu
     """Función síncrona para generar el archivo PDF (CPU-Bound)."""
     pdf = PDF()
     
-    # MODIFICADO: Se eliminó add_font para NotoSans. Ahora solo se usan fuentes estándar (Arial).
-
     pdf.alias_nb_pages()
     pdf.add_page()
     
-    # MODIFICADO: Usar Arial directamente
+    # Usar Arial directamente
     pdf.set_font("Arial", "B", 12)
 
     pdf.cell(0, 10, "Instrucciones", 0, 1)
     
-    # MODIFICADO: Usar Arial directamente
+    # Usar Arial directamente
     pdf.set_font("Arial", "", 11)
         
     pdf.multi_cell(0, 6, instructions)
     pdf.ln(5)
     
-    # MODIFICADO: Usar Arial directamente
+    # Usar Arial directamente
     pdf.set_font("Arial", "B", 12)
         
     pdf.cell(0, 10, "Análisis", 0, 1)
     
-    # MODIFICADO: Usar Arial directamente
+    # Usar Arial directamente
     pdf.set_font("Arial", "", 11)
-        
-    md = MarkdownIt()
-    html = md.render(analysis_text)
     
     stream = io.BytesIO()
-    try:
-        # write_html debería funcionar bien con fuentes estándar.
-        pdf.write_html(html)
-    except Exception as e:
-        # Fallback si write_html falla
-        print(f"Advertencia: write_html falló ({e}). Usando multi_cell como fallback.")
-        pdf.multi_cell(0, 6, analysis_text)
+    
+    # CORREGIDO: Se eliminó el uso de markdown_it y pdf.write_html para evitar que el PDF salga en blanco.
+    # Se usa multi_cell directamente con el texto de análisis (que ya es texto plano/markdown).
+    # Esta es la forma más estable de volcar contenido de texto en fpdf.
+    pdf.multi_cell(0, 6, analysis_text)
     
     # pdf.output(dest='S') es la operación CPU-Bound que devuelve el contenido
     stream.write(pdf.output(dest='S').encode('latin1', 'ignore'))
@@ -329,7 +322,8 @@ async def download_analysis(
     current_user: Dict[str, Any] = Depends(get_current_user)
 ):
     try:
-        timestamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
+        # El formato incluye Año, Mes, Día, Hora, Minutos y Segundos (YYYY-MM-DD_HHMMSS)
+        timestamp = datetime.now().strftime("%Y-%m-%d_%H%M%S") 
 
         if file_format.lower() == "docx":
             # Mover la generación DOCX a un hilo secundario
