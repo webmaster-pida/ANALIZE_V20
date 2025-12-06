@@ -38,7 +38,7 @@ except:
     PROJECT_ID = os.getenv("PROJECT_ID")
 
 LOCATION = os.getenv("GOOGLE_CLOUD_LOCATION", "us-central1")
-GEMINI_MODEL_NAME = os.getenv("GEMINI_MODEL", "gemini-1.5-flash-001").strip()
+GEMINI_MODEL_NAME = os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip()
 
 if PROJECT_ID:
     try:
@@ -179,7 +179,7 @@ async def analyze_documents(
             # Usamos generate_content_async con stream=True
             responses = await model.generate_content_async(
                 model_parts,
-                generation_config={"temperature": 0.3, "max_output_tokens": 8192},
+                generation_config={"temperature": 0.4, "max_output_tokens": 16348},
                 safety_settings=safety,
                 stream=True
             )
