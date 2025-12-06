@@ -91,7 +91,7 @@ def parse_and_add_markdown_to_docx(document, markdown_text):
 
 class PDF(FPDF):
     def header(self):
-        # Usando Arial (fuente estándar FPDF)
+        # Se mantiene Arial para la cabecera por ser la más estable
         self.set_font("Arial", "B", 15)
         self.set_text_color(29, 53, 87)
         self.cell(0, 10, "PIDA-AI: Resumen de Consulta", 0, 1, "L")
@@ -137,36 +137,46 @@ def create_pdf_sync(analysis_text: str, instructions: str, timestamp: str) -> tu
     """Función síncrona para generar el archivo PDF (CPU-Bound)."""
     pdf = PDF()
     
+    # CORREGIDO: Reintroducir la carga de fuente Unicode aquí.
+    # Esto es vital para que multi_cell pueda renderizar correctamente texto no-ASCII.
+    try:
+        # Se asume que estos archivos están accesibles.
+        pdf.add_font("NotoSans", "", "fonts/NotoSans-Regular.ttf", uni=True)
+        pdf.add_font("NotoSans", "B", "fonts/NotoSans-Bold.ttf", uni=True)
+        pdf_font = "NotoSans"
+    except Exception as e:
+        # Fallback a Arial si la fuente personalizada falla.
+        # Imprimir el error es útil para el debug en el entorno.
+        print(f"Advertencia: No se pudieron cargar las fuentes NotoSans. Usando Arial. Error: {e}")
+        pdf_font = "Arial"
+    
     pdf.alias_nb_pages()
     pdf.add_page()
     
-    # Usar Arial directamente
-    pdf.set_font("Arial", "B", 12)
+    # Usar la fuente determinada (NotoSans o Arial)
+    pdf.set_font(pdf_font, "B", 12)
 
     pdf.cell(0, 10, "Instrucciones", 0, 1)
     
-    # Usar Arial directamente
-    pdf.set_font("Arial", "", 11)
+    pdf.set_font(pdf_font, "", 11)
         
     pdf.multi_cell(0, 6, instructions)
     pdf.ln(5)
     
-    # Usar Arial directamente
-    pdf.set_font("Arial", "B", 12)
+    pdf.set_font(pdf_font, "B", 12)
         
     pdf.cell(0, 10, "Análisis", 0, 1)
     
-    # Usar Arial directamente
-    pdf.set_font("Arial", "", 11)
+    pdf.set_font(pdf_font, "", 11)
     
     stream = io.BytesIO()
     
-    # CORREGIDO: Se eliminó el uso de markdown_it y pdf.write_html para evitar que el PDF salga en blanco.
-    # Se usa multi_cell directamente con el texto de análisis (que ya es texto plano/markdown).
-    # Esta es la forma más estable de volcar contenido de texto en fpdf.
+    # Se usa multi_cell que es más estable para volcar grandes bloques de texto.
     pdf.multi_cell(0, 6, analysis_text)
     
     # pdf.output(dest='S') es la operación CPU-Bound que devuelve el contenido
+    # Se mantiene la codificación latin1 para compatibilidad con fpdf base,
+    # el parámetro uni=True en add_font (si funciona) debería encargarse del Unicode.
     stream.write(pdf.output(dest='S').encode('latin1', 'ignore'))
     stream.seek(0)
     
