@@ -17,7 +17,6 @@ from docx.shared import Pt
 from fpdf import FPDF
 from markdown_it import MarkdownIt
 from datetime import datetime
-# MODIFICADO: Importar AsyncClient, SERVER_TIMESTAMP, y Query para operaciones asíncronas
 from google.cloud.firestore import AsyncClient, SERVER_TIMESTAMP, Query
 import google.auth
 
@@ -49,7 +48,6 @@ if PROJECT_ID:
         print(f"Error Vertex AI: {e}")
 
 # Inicializar Firestore
-# MODIFICADO: Usar AsyncClient
 db = AsyncClient(project=PROJECT_ID)
 
 app = FastAPI(title="PIDA Document Analyzer (Streaming)")
@@ -93,9 +91,9 @@ def parse_and_add_markdown_to_docx(document, markdown_text):
 
 class PDF(FPDF):
     def header(self):
+        # MODIFICADO: Se eliminó add_font de aquí para evitar problemas de estado y multihilo.
         try:
-            self.add_font("NotoSans", "", "fonts/NotoSans-Regular.ttf", uni=True)
-            self.add_font("NotoSans", "B", "fonts/NotoSans-Bold.ttf", uni=True)
+            # Solo establecer fuente, asumiendo que ya fue añadida en create_pdf_sync
             self.set_font("NotoSans", "B", 15)
         except RuntimeError:
             self.set_font("Arial", "B", 15)
@@ -142,10 +140,19 @@ def create_docx_sync(analysis_text: str, instructions: str, timestamp: str) -> t
 def create_pdf_sync(analysis_text: str, instructions: str, timestamp: str) -> tuple[bytes, str, str]:
     """Función síncrona para generar el archivo PDF (CPU-Bound)."""
     pdf = PDF()
+    
+    # MODIFICADO: Añadir las fuentes aquí (una sola vez) antes de generar contenido.
+    try:
+        pdf.add_font("NotoSans", "", "fonts/NotoSans-Regular.ttf", uni=True)
+        pdf.add_font("NotoSans", "B", "fonts/NotoSans-Bold.ttf", uni=True)
+    except RuntimeError as e:
+        # Si falla, el set_font posterior usará el fallback de Arial.
+        print(f"Advertencia: No se pudieron cargar las fuentes NotoSans: {e}")
+
     pdf.alias_nb_pages()
     pdf.add_page()
     
-    # Intenta usar la fuente NotoSans (definida en PDF header)
+    # Tenta usar a fonte NotoSans (definida na PDF header)
     try:
         pdf.set_font("NotoSans", "B", 12)
     except RuntimeError:
@@ -183,7 +190,7 @@ def create_pdf_sync(analysis_text: str, instructions: str, timestamp: str) -> tu
         # Fallback si write_html falla
         pdf.multi_cell(0, 6, analysis_text)
     
-    # pdf.output(dest='S') es la operación CPU-Bound
+    # pdf.output(dest='S') es la operación CPU-Bound que devuelve el contenido
     stream.write(pdf.output(dest='S').encode('latin1', 'ignore'))
     stream.seek(0)
     
@@ -221,7 +228,7 @@ async def analyze_documents(
             model_parts.append(part)
         else:
             try:
-                # MODIFICADO: Usar asyncio.to_thread para no bloquear el Event Loop con docx
+                # Usar asyncio.to_thread para no bloquear el Event Loop con docx
                 text = await asyncio.to_thread(read_docx_sync, content)
                 model_parts.append(f"--- DOC: {file.filename} ---\n{text}\n------\n")
             except Exception as e:
@@ -277,7 +284,7 @@ async def analyze_documents(
             title = (instructions[:40] + '...') if len(instructions) > 40 else instructions
             
             doc_ref = db.collection("analysis_history").document()
-            # MODIFICADO: Usar await con doc_ref.set()
+            # Usar await con doc_ref.set()
             await doc_ref.set({
                 "userId": user_id,
                 "title": title,
@@ -301,11 +308,11 @@ async def analyze_documents(
 @app.get("/analysis-history/")
 async def get_analysis_history(current_user: Dict[str, Any] = Depends(get_current_user)):
     user_id = current_user.get("uid")
-    # MODIFICADO: Usar Query.DESCENDING importado
+    # Usar Query.DESCENDING importado
     ref = db.collection("analysis_history").where("userId", "==", user_id).order_by("timestamp", direction=Query.DESCENDING)
     
     history = []
-    # MODIFICADO: Usar async for en el stream del AsyncClient
+    # Usar async for en el stream del AsyncClient
     async for d in ref.stream():
         history.append({"id": d.id, "title": d.get("title"), "timestamp": d.get("timestamp")})
         
@@ -313,7 +320,7 @@ async def get_analysis_history(current_user: Dict[str, Any] = Depends(get_curren
 
 @app.get("/analysis-history/{analysis_id}")
 async def get_analysis_detail(analysis_id: str, current_user: Dict[str, Any] = Depends(get_current_user)):
-    # MODIFICADO: Usar await con doc.get()
+    # Usar await con doc.get()
     doc = await db.collection("analysis_history").document(analysis_id).get()
     if not doc.exists: raise HTTPException(404, "No encontrado")
     data = doc.to_dict()
@@ -323,11 +330,11 @@ async def get_analysis_detail(analysis_id: str, current_user: Dict[str, Any] = D
 @app.delete("/analysis-history/{analysis_id}")
 async def delete_analysis(analysis_id: str, current_user: Dict[str, Any] = Depends(get_current_user)):
     ref = db.collection("analysis_history").document(analysis_id)
-    # MODIFICADO: Usar await con doc.get()
+    # Usar await con doc.get()
     doc = await ref.get()
     if not doc.exists: raise HTTPException(404, "No encontrado")
     if doc.to_dict().get("userId") != current_user.get("uid"): raise HTTPException(403, "Sin permiso")
-    # MODIFICADO: Usar await con ref.delete()
+    # Usar await con ref.delete()
     await ref.delete()
     return {"status": "ok"}
 
@@ -342,13 +349,13 @@ async def download_analysis(
         timestamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
 
         if file_format.lower() == "docx":
-            # MODIFICADO: Mover la generación DOCX a un hilo secundario
+            # Mover la generación DOCX a un hilo secundario
             content, mime, fname = await asyncio.to_thread(create_docx_sync, analysis_text, instructions, timestamp)
         else:
-            # MODIFICADO: Mover la generación PDF a un hilo secundario
+            # Mover la generación PDF a un hilo secundario
             content, mime, fname = await asyncio.to_thread(create_pdf_sync, analysis_text, instructions, timestamp)
 
-        # MODIFICADO: Retornar la respuesta con el contenido generado en el hilo
+        # Retornar la respuesta con el contenido generado en el hilo
         return Response(content=content, media_type=mime, headers={"Content-Disposition": f"attachment; filename={fname}"})
     except Exception as e:
         raise HTTPException(500, f"Error generando archivo: {e}")
