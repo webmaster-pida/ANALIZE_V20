@@ -91,12 +91,8 @@ def parse_and_add_markdown_to_docx(document, markdown_text):
 
 class PDF(FPDF):
     def header(self):
-        # MODIFICADO: Se eliminó add_font de aquí para evitar problemas de estado y multihilo.
-        try:
-            # Solo establecer fuente, asumiendo que ya fue añadida en create_pdf_sync
-            self.set_font("NotoSans", "B", 15)
-        except RuntimeError:
-            self.set_font("Arial", "B", 15)
+        # MODIFICADO: Solo usar Arial (fuente estándar FPDF)
+        self.set_font("Arial", "B", 15)
         self.set_text_color(29, 53, 87)
         self.cell(0, 10, "PIDA-AI: Resumen de Consulta", 0, 1, "L")
         self.set_font("Arial", "", 10)
@@ -141,53 +137,40 @@ def create_pdf_sync(analysis_text: str, instructions: str, timestamp: str) -> tu
     """Función síncrona para generar el archivo PDF (CPU-Bound)."""
     pdf = PDF()
     
-    # MODIFICADO: Añadir las fuentes aquí (una sola vez) antes de generar contenido.
-    try:
-        pdf.add_font("NotoSans", "", "fonts/NotoSans-Regular.ttf", uni=True)
-        pdf.add_font("NotoSans", "B", "fonts/NotoSans-Bold.ttf", uni=True)
-    except RuntimeError as e:
-        # Si falla, el set_font posterior usará el fallback de Arial.
-        print(f"Advertencia: No se pudieron cargar las fuentes NotoSans: {e}")
+    # MODIFICADO: Se eliminó add_font para NotoSans. Ahora solo se usan fuentes estándar (Arial).
 
     pdf.alias_nb_pages()
     pdf.add_page()
     
-    # Tenta usar a fonte NotoSans (definida na PDF header)
-    try:
-        pdf.set_font("NotoSans", "B", 12)
-    except RuntimeError:
-        pdf.set_font("Arial", "B", 12)
+    # MODIFICADO: Usar Arial directamente
+    pdf.set_font("Arial", "B", 12)
 
     pdf.cell(0, 10, "Instrucciones", 0, 1)
     
-    try:
-        pdf.set_font("NotoSans", "", 11)
-    except RuntimeError:
-        pdf.set_font("Arial", "", 11)
+    # MODIFICADO: Usar Arial directamente
+    pdf.set_font("Arial", "", 11)
         
     pdf.multi_cell(0, 6, instructions)
     pdf.ln(5)
     
-    try:
-        pdf.set_font("NotoSans", "B", 12)
-    except RuntimeError:
-        pdf.set_font("Arial", "B", 12)
+    # MODIFICADO: Usar Arial directamente
+    pdf.set_font("Arial", "B", 12)
         
     pdf.cell(0, 10, "Análisis", 0, 1)
     
-    try:
-        pdf.set_font("NotoSans", "", 11)
-    except RuntimeError:
-        pdf.set_font("Arial", "", 11)
+    # MODIFICADO: Usar Arial directamente
+    pdf.set_font("Arial", "", 11)
         
     md = MarkdownIt()
     html = md.render(analysis_text)
     
     stream = io.BytesIO()
     try:
+        # write_html debería funcionar bien con fuentes estándar.
         pdf.write_html(html)
-    except:
+    except Exception as e:
         # Fallback si write_html falla
+        print(f"Advertencia: write_html falló ({e}). Usando multi_cell como fallback.")
         pdf.multi_cell(0, 6, analysis_text)
     
     # pdf.output(dest='S') es la operación CPU-Bound que devuelve el contenido
