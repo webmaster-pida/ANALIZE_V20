@@ -40,19 +40,25 @@ async def get_current_user(request: Request):
         # 1. Verificar firma del token
         decoded_token = auth.verify_id_token(token)
         
-        # 2. Obtener datos del usuario
-        email = decoded_token.get("email", "").lower()
+        # 2. Obtener datos del usuario (Normalizados)
+        email = decoded_token.get("email", "").strip().lower()
         domain = email.split("@")[1] if "@" in email else ""
         
-        # 3. Leer reglas directamente del Entorno (Sin src.config)
+        # 3. Leer reglas directamente del Entorno
         raw_domains = os.getenv("ADMIN_DOMAINS", '[]')
         raw_emails = os.getenv("ADMIN_EMAILS", '[]')
 
         try:
-            allowed_domains = json.loads(raw_domains)
-            allowed_emails = [e.lower() for e in json.loads(raw_emails)]
+            # CORRECCIÓN AQUÍ: Limpiamos las listas (strip + lower) para evitar errores de espacios o mayúsculas
+            domains_list = json.loads(raw_domains)
+            allowed_domains = [str(d).strip().lower() for d in domains_list]
+            
+            emails_list = json.loads(raw_emails)
+            allowed_emails = [str(e).strip().lower() for e in emails_list]
+            
         except Exception as e:
-            log.error(f"Error procesando reglas de seguridad: {e}")
+            log.error(f"Error procesando reglas de seguridad (JSON inválido): {e}")
+            # Si falla, cerramos el acceso por seguridad
             allowed_domains = []
             allowed_emails = []
 
@@ -64,7 +70,8 @@ async def get_current_user(request: Request):
             is_email_authorized = email in allowed_emails
             
             if not (is_domain_authorized or is_email_authorized):
-                log.warning(f"ACCESO DENEGADO: {email}")
+                # Logueamos el rechazo para poder depurar en Cloud Run si hace falta
+                log.warning(f"ACCESO DENEGADO: {email}. Dominio '{domain}' no está en la lista permitida.")
                 raise HTTPException(
                     status_code=status.HTTP_403_FORBIDDEN,
                     detail="No tienes autorización para usar este servicio."
