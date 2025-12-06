@@ -17,7 +17,8 @@ from docx.shared import Pt
 from fpdf import FPDF
 from markdown_it import MarkdownIt
 from datetime import datetime
-from google.cloud import firestore
+# MODIFICADO: Importar AsyncClient, SERVER_TIMESTAMP, y Query para operaciones asíncronas
+from google.cloud.firestore import AsyncClient, SERVER_TIMESTAMP, Query
 import google.auth
 
 # --- VERTEX AI SDK ---
@@ -48,7 +49,8 @@ if PROJECT_ID:
         print(f"Error Vertex AI: {e}")
 
 # Inicializar Firestore
-db = firestore.Client(project=PROJECT_ID)
+# MODIFICADO: Usar AsyncClient
+db = AsyncClient(project=PROJECT_ID)
 
 app = FastAPI(title="PIDA Document Analyzer (Streaming)")
 
@@ -110,6 +112,86 @@ class PDF(FPDF):
         self.set_text_color(128, 128, 128)
         self.cell(0, 10, f"Página {self.page_no()}/{{nb}}", 0, 0, "C")
 
+
+# --- UTILIDADES ASÍNCRONAS PARA PROCESAMIENTO/DESCARGA (to_thread helpers) ---
+
+def read_docx_sync(content: bytes) -> str:
+    """Función síncrona para leer el contenido de un DOCX (CPU-Bound)."""
+    doc = Document(io.BytesIO(content))
+    return "\n".join([p.text for p in doc.paragraphs])
+
+def create_docx_sync(analysis_text: str, instructions: str, timestamp: str) -> tuple[bytes, str, str]:
+    """Función síncrona para generar el archivo DOCX (CPU-Bound)."""
+    stream = io.BytesIO()
+    doc = Document()
+    try:
+        doc.styles['Normal'].font.name = 'Arial'
+    except: pass
+    doc.add_heading("PIDA-AI: Resumen", 0)
+    doc.add_paragraph(f"Fecha: {datetime.now().strftime('%d/%m/%Y, %H:%M:%S')}")
+    doc.add_heading("Instrucciones", 2)
+    doc.add_paragraph(instructions)
+    doc.add_heading("Análisis", 2)
+    parse_and_add_markdown_to_docx(doc, analysis_text)
+    doc.save(stream)
+    stream.seek(0)
+    mime = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+    fname = f"PIDA_{timestamp}.docx"
+    return stream.read(), mime, fname
+
+def create_pdf_sync(analysis_text: str, instructions: str, timestamp: str) -> tuple[bytes, str, str]:
+    """Función síncrona para generar el archivo PDF (CPU-Bound)."""
+    pdf = PDF()
+    pdf.alias_nb_pages()
+    pdf.add_page()
+    
+    # Intenta usar la fuente NotoSans (definida en PDF header)
+    try:
+        pdf.set_font("NotoSans", "B", 12)
+    except RuntimeError:
+        pdf.set_font("Arial", "B", 12)
+
+    pdf.cell(0, 10, "Instrucciones", 0, 1)
+    
+    try:
+        pdf.set_font("NotoSans", "", 11)
+    except RuntimeError:
+        pdf.set_font("Arial", "", 11)
+        
+    pdf.multi_cell(0, 6, instructions)
+    pdf.ln(5)
+    
+    try:
+        pdf.set_font("NotoSans", "B", 12)
+    except RuntimeError:
+        pdf.set_font("Arial", "B", 12)
+        
+    pdf.cell(0, 10, "Análisis", 0, 1)
+    
+    try:
+        pdf.set_font("NotoSans", "", 11)
+    except RuntimeError:
+        pdf.set_font("Arial", "", 11)
+        
+    md = MarkdownIt()
+    html = md.render(analysis_text)
+    
+    stream = io.BytesIO()
+    try:
+        pdf.write_html(html)
+    except:
+        # Fallback si write_html falla
+        pdf.multi_cell(0, 6, analysis_text)
+    
+    # pdf.output(dest='S') es la operación CPU-Bound
+    stream.write(pdf.output(dest='S').encode('latin1', 'ignore'))
+    stream.seek(0)
+    
+    mime = "application/pdf"
+    fname = f"PIDA_{timestamp}.pdf"
+    return stream.read(), mime, fname
+
+
 # --- ENDPOINT STREAMING ---
 @app.post("/analyze/")
 async def analyze_documents(
@@ -139,11 +221,11 @@ async def analyze_documents(
             model_parts.append(part)
         else:
             try:
-                doc = Document(io.BytesIO(content))
-                text = "\n".join([p.text for p in doc.paragraphs])
+                # MODIFICADO: Usar asyncio.to_thread para no bloquear el Event Loop con docx
+                text = await asyncio.to_thread(read_docx_sync, content)
                 model_parts.append(f"--- DOC: {file.filename} ---\n{text}\n------\n")
-            except:
-                raise HTTPException(status_code=400, detail=f"Error leyendo DOCX {file.filename}")
+            except Exception as e:
+                raise HTTPException(status_code=400, detail=f"Error leyendo DOCX {file.filename}: {e}")
 
     model_parts.append(f"\nINSTRUCCIONES: {instructions}")
 
@@ -195,12 +277,13 @@ async def analyze_documents(
             title = (instructions[:40] + '...') if len(instructions) > 40 else instructions
             
             doc_ref = db.collection("analysis_history").document()
-            doc_ref.set({
+            # MODIFICADO: Usar await con doc_ref.set()
+            await doc_ref.set({
                 "userId": user_id,
                 "title": title,
                 "instructions": instructions,
                 "analysis": full_text,
-                "timestamp": firestore.SERVER_TIMESTAMP,
+                "timestamp": SERVER_TIMESTAMP, # Usar SERVER_TIMESTAMP importado
                 "original_filenames": original_filenames
             })
             
@@ -214,16 +297,24 @@ async def analyze_documents(
     # Retornamos la respuesta como un stream de eventos
     return StreamingResponse(generate_stream(), media_type="text/event-stream")
 
-# ... (Resto de endpoints GET, DELETE, DOWNLOAD siguen igual) ...
+# ... (Resto de endpoints GET, DELETE, DOWNLOAD) ...
 @app.get("/analysis-history/")
 async def get_analysis_history(current_user: Dict[str, Any] = Depends(get_current_user)):
     user_id = current_user.get("uid")
-    ref = db.collection("analysis_history").where("userId", "==", user_id).order_by("timestamp", direction=firestore.Query.DESCENDING)
-    return [{"id": d.id, "title": d.get("title"), "timestamp": d.get("timestamp")} for d in ref.stream()]
+    # MODIFICADO: Usar Query.DESCENDING importado
+    ref = db.collection("analysis_history").where("userId", "==", user_id).order_by("timestamp", direction=Query.DESCENDING)
+    
+    history = []
+    # MODIFICADO: Usar async for en el stream del AsyncClient
+    async for d in ref.stream():
+        history.append({"id": d.id, "title": d.get("title"), "timestamp": d.get("timestamp")})
+        
+    return history
 
 @app.get("/analysis-history/{analysis_id}")
 async def get_analysis_detail(analysis_id: str, current_user: Dict[str, Any] = Depends(get_current_user)):
-    doc = db.collection("analysis_history").document(analysis_id).get()
+    # MODIFICADO: Usar await con doc.get()
+    doc = await db.collection("analysis_history").document(analysis_id).get()
     if not doc.exists: raise HTTPException(404, "No encontrado")
     data = doc.to_dict()
     if data.get("userId") != current_user.get("uid"): raise HTTPException(403, "Sin permiso")
@@ -232,10 +323,12 @@ async def get_analysis_detail(analysis_id: str, current_user: Dict[str, Any] = D
 @app.delete("/analysis-history/{analysis_id}")
 async def delete_analysis(analysis_id: str, current_user: Dict[str, Any] = Depends(get_current_user)):
     ref = db.collection("analysis_history").document(analysis_id)
-    doc = ref.get()
+    # MODIFICADO: Usar await con doc.get()
+    doc = await ref.get()
     if not doc.exists: raise HTTPException(404, "No encontrado")
     if doc.to_dict().get("userId") != current_user.get("uid"): raise HTTPException(403, "Sin permiso")
-    ref.delete()
+    # MODIFICADO: Usar await con ref.delete()
+    await ref.delete()
     return {"status": "ok"}
 
 @app.post("/download-analysis")
@@ -247,46 +340,16 @@ async def download_analysis(
 ):
     try:
         timestamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
-        stream = io.BytesIO()
 
         if file_format.lower() == "docx":
-            doc = Document()
-            try:
-                doc.styles['Normal'].font.name = 'Arial'
-            except: pass
-            doc.add_heading("PIDA-AI: Resumen", 0)
-            doc.add_paragraph(f"Fecha: {datetime.now()}")
-            doc.add_heading("Instrucciones", 2)
-            doc.add_paragraph(instructions)
-            doc.add_heading("Análisis", 2)
-            parse_and_add_markdown_to_docx(doc, analysis_text)
-            doc.save(stream)
-            mime = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-            fname = f"PIDA_{timestamp}.docx"
+            # MODIFICADO: Mover la generación DOCX a un hilo secundario
+            content, mime, fname = await asyncio.to_thread(create_docx_sync, analysis_text, instructions, timestamp)
         else:
-            pdf = PDF()
-            pdf.alias_nb_pages()
-            pdf.add_page()
-            pdf.set_font("Arial", "B", 12)
-            pdf.cell(0, 10, "Instrucciones", 0, 1)
-            pdf.set_font("Arial", "", 11)
-            pdf.multi_cell(0, 6, instructions)
-            pdf.ln(5)
-            pdf.set_font("Arial", "B", 12)
-            pdf.cell(0, 10, "Análisis", 0, 1)
-            pdf.set_font("Arial", "", 11)
-            md = MarkdownIt()
-            html = md.render(analysis_text)
-            try:
-                pdf.write_html(html)
-            except:
-                pdf.multi_cell(0, 6, analysis_text)
-            stream.write(pdf.output(dest='S').encode('latin1', 'ignore'))
-            mime = "application/pdf"
-            fname = f"PIDA_{timestamp}.pdf"
+            # MODIFICADO: Mover la generación PDF a un hilo secundario
+            content, mime, fname = await asyncio.to_thread(create_pdf_sync, analysis_text, instructions, timestamp)
 
-        stream.seek(0)
-        return Response(content=stream.read(), media_type=mime, headers={"Content-Disposition": f"attachment; filename={fname}"})
+        # MODIFICADO: Retornar la respuesta con el contenido generado en el hilo
+        return Response(content=content, media_type=mime, headers={"Content-Disposition": f"attachment; filename={fname}"})
     except Exception as e:
         raise HTTPException(500, f"Error generando archivo: {e}")
 
