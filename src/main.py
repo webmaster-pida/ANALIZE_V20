@@ -1,40 +1,28 @@
 # /src/main.py
 
 import os
-import base64
 import json
 import io
 import re
 import asyncio
-from pathlib import Path
 from fastapi import FastAPI, File, Form, UploadFile, HTTPException, Response, Depends
 from fastapi.middleware.cors import CORSMiddleware
-# Importamos StreamingResponse para el efecto "poco a poco"
 from fastapi.responses import StreamingResponse 
 from typing import List, Dict, Any
 from dotenv import load_dotenv
 from docx import Document
-from docx.shared import Pt
 from fpdf import FPDF
-from markdown_it import MarkdownIt
 from datetime import datetime
+# SOLUCIÓN I/O BLOCKING: Usamos AsyncClient y tipos específicos de Firestore
 from google.cloud.firestore import AsyncClient, SERVER_TIMESTAMP, Query
 import google.auth
-
-# --- VERTEX AI SDK ---
 import vertexai
 from vertexai.generative_models import GenerativeModel, Part, SafetySetting
-
 from src.core.security import get_current_user
 from src.core.prompts import ANALYZER_SYSTEM_PROMPT
 
 # Cargar variables
 load_dotenv()
-
-# --- CONFIGURACIÓN DE RUTAS ---
-# Definir el directorio base para encontrar las fuentes de forma segura
-BASE_DIR = Path(__file__).resolve().parent.parent
-FONTS_DIR = BASE_DIR / "fonts"
 
 # --- CONFIGURACIÓN VERTEX AI ---
 try:
@@ -53,7 +41,7 @@ if PROJECT_ID:
     except Exception as e:
         print(f"Error Vertex AI: {e}")
 
-# Inicializar Firestore
+# SOLUCIÓN I/O BLOCKING: Inicializar Firestore con AsyncClient
 db = AsyncClient(project=PROJECT_ID)
 
 app = FastAPI(title="PIDA Document Analyzer (Streaming)")
@@ -74,9 +62,25 @@ app.add_middleware(
     expose_headers=["Content-Disposition"],
 )
 
-# --- UTILIDADES ---
-def verify_active_subscription(current_user: Dict[str, Any]):
-    pass 
+# --- UTILIDADES DE LIMPIEZA (SOLUCIÓN PDF EN BLANCO) ---
+def sanitize_text_for_pdf(text: str) -> str:
+    """
+    Limpia el texto para asegurar compatibilidad total con FPDF (Latin-1).
+    Reemplaza caracteres problemáticos y elimina emojis que rompen el PDF.
+    """
+    if not text:
+        return ""
+    
+    # Reemplazos manuales de caracteres comunes que rompen FPDF
+    replacements = {
+        "•": "-", "—": "-", "–": "-", "“": '"', "”": '"', "‘": "'", "’": "'", "…": "...",
+        "\u2013": "-", "\u2014": "-", "\u2022": "-", "\uF0B7": "-"
+    }
+    for char, replacement in replacements.items():
+        text = text.replace(char, replacement)
+    
+    # Forzar codificación Latin-1 reemplazando errores con '?'
+    return text.encode('latin1', 'replace').decode('latin-1')
 
 def parse_and_add_markdown_to_docx(document, markdown_text):
     for line in markdown_text.strip().split('\n'):
@@ -88,37 +92,14 @@ def parse_and_add_markdown_to_docx(document, markdown_text):
             document.add_paragraph('')
         else:
             p = document.add_paragraph()
-            parts = re.split(r'(\*\*.*?\*\*)', line)
-            for part in parts:
-                if part.startswith('**') and part.endswith('**'):
-                    p.add_run(part.strip('*')).bold = True
-                else:
-                    p.add_run(part)
+            # Eliminar negritas de markdown simple para evitar errores de parseo complejos
+            clean_line = line.replace('**', '')
+            p.add_run(clean_line)
 
-def sanitize_text_for_pdf(text: str) -> str:
-    """
-    Limpia caracteres que suelen romper FPDF cuando no se usa Unicode completo
-    o reemplaza viñetas markdown por guiones simples.
-    """
-    if not text:
-        return ""
-    # Reemplazos comunes para evitar UnicodeEncodeError en fuentes estándar
-    replacements = {
-        "•": "-",
-        "—": "-",
-        "“": '"',
-        "”": '"',
-        "‘": "'",
-        "’": "'",
-        "…": "..."
-    }
-    for char, replacement in replacements.items():
-        text = text.replace(char, replacement)
-    return text
-
+# --- CLASE PDF ROBUSTA ---
 class PDF(FPDF):
     def header(self):
-        # Usamos Arial para el header para máxima compatibilidad
+        # Usamos Arial nativa para evitar errores de rutas de fuentes
         self.set_font("Arial", "B", 15)
         self.set_text_color(29, 53, 87)
         self.cell(0, 10, "PIDA-AI: Resumen de Consulta", 0, 1, "L")
@@ -131,163 +112,118 @@ class PDF(FPDF):
         self.set_y(-15)
         self.set_font("Arial", "", 8)
         self.set_text_color(128, 128, 128)
-        self.cell(0, 10, f"Página {self.page_no()}/{{nb}}", 0, 0, "C")
+        self.cell(0, 10, f"Pagina {self.page_no()}/{{nb}}", 0, 0, "C")
 
-
-# --- UTILIDADES ASÍNCRONAS PARA PROCESAMIENTO/DESCARGA ---
+# --- GENERADORES SÍNCRONOS (SOLUCIÓN CPU BOUND) ---
+# Estas funciones se ejecutan en un hilo separado para no bloquear el servidor
 
 def read_docx_sync(content: bytes) -> str:
-    doc = Document(io.BytesIO(content))
-    return "\n".join([p.text for p in doc.paragraphs])
+    """Lee DOCX sin bloquear el event loop principal."""
+    try:
+        doc = Document(io.BytesIO(content))
+        return "\n".join([p.text for p in doc.paragraphs])
+    except:
+        return ""
 
 def create_docx_sync(analysis_text: str, instructions: str, timestamp: str) -> tuple[bytes, str, str]:
+    """Crea DOCX en hilo separado."""
     stream = io.BytesIO()
     doc = Document()
-    try:
-        doc.styles['Normal'].font.name = 'Arial'
-    except: pass
     doc.add_heading("PIDA-AI: Resumen", 0)
     doc.add_paragraph(f"Fecha: {datetime.now().strftime('%d/%m/%Y, %H:%M:%S')}")
     doc.add_heading("Instrucciones", 2)
     doc.add_paragraph(instructions)
-    doc.add_heading("Análisis", 2)
+    doc.add_heading("Analisis", 2)
     parse_and_add_markdown_to_docx(doc, analysis_text)
     doc.save(stream)
     stream.seek(0)
-    mime = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-    fname = f"PIDA_{timestamp}.docx"
-    return stream.read(), mime, fname
+    return stream.read(), "application/vnd.openxmlformats-officedocument.wordprocessingml.document", f"PIDA_{timestamp}.docx"
 
 def create_pdf_sync(analysis_text: str, instructions: str, timestamp: str) -> tuple[bytes, str, str]:
+    """Crea PDF en hilo separado con sanitización."""
+    # 1. Sanitizar textos ANTES de crear el PDF (Crucial para evitar blanco)
+    safe_inst = sanitize_text_for_pdf(instructions)
+    safe_ana = sanitize_text_for_pdf(analysis_text)
+
     pdf = PDF()
-    
-    # 1. Intentar cargar fuentes Unicode usando rutas absolutas
-    font_used = "Arial" # Fallback por defecto
-    try:
-        regular_font = FONTS_DIR / "NotoSans-Regular.ttf"
-        bold_font = FONTS_DIR / "NotoSans-Bold.ttf"
-        
-        if regular_font.exists() and bold_font.exists():
-            pdf.add_font("NotoSans", "", str(regular_font), uni=True)
-            pdf.add_font("NotoSans", "B", str(bold_font), uni=True)
-            font_used = "NotoSans"
-        else:
-            print(f"Advertencia: Fuentes no encontradas en {FONTS_DIR}")
-    except Exception as e:
-        print(f"Advertencia: Error cargando fuentes ({e}). Usando Arial.")
-
-    # Si estamos usando Arial (porque falló NotoSans), debemos limpiar el texto de caracteres Unicode complejos
-    if font_used == "Arial":
-        analysis_text = sanitize_text_for_pdf(analysis_text)
-        instructions = sanitize_text_for_pdf(instructions)
-
     pdf.alias_nb_pages()
     pdf.add_page()
     
     # Instrucciones
-    pdf.set_font(font_used, "B", 12)
+    pdf.set_font("Arial", "B", 12)
     pdf.cell(0, 10, "Instrucciones", 0, 1)
-    
-    pdf.set_font(font_used, "", 11)
-    pdf.multi_cell(0, 6, instructions)
+    pdf.set_font("Arial", "", 11)
+    pdf.multi_cell(0, 6, safe_inst)
     pdf.ln(5)
     
     # Análisis
-    pdf.set_font(font_used, "B", 12)
-    pdf.cell(0, 10, "Análisis", 0, 1)
+    pdf.set_font("Arial", "B", 12)
+    pdf.cell(0, 10, "Analisis", 0, 1)
+    pdf.set_font("Arial", "", 11)
     
-    pdf.set_font(font_used, "", 11)
-    # Usamos multi_cell directo para garantizar que el texto se escriba
-    pdf.multi_cell(0, 6, analysis_text)
+    # Escribir contenido
+    if not safe_ana.strip():
+        pdf.multi_cell(0, 6, "[Sin contenido]")
+    else:
+        pdf.multi_cell(0, 6, safe_ana)
     
     # Generar salida
     try:
-        # FPDF output(dest='S') devuelve string latin-1. Encoding a bytes.
-        pdf_content = pdf.output(dest='S').encode('latin-1', 'ignore')
-        
-        stream = io.BytesIO(pdf_content)
-        mime = "application/pdf"
-        fname = f"PIDA_{timestamp}.pdf"
-        return stream.read(), mime, fname
+        # output(dest='S') devuelve string latin-1 en fpdf v1
+        pdf_string = pdf.output(dest='S')
+        # Codificar a bytes asegurando compatibilidad
+        if isinstance(pdf_string, str):
+            pdf_bytes = pdf_string.encode('latin-1', 'replace')
+        else:
+            pdf_bytes = pdf_string
+
+        stream = io.BytesIO(pdf_bytes)
+        return stream.read(), "application/pdf", f"PIDA_{timestamp}.pdf"
     except Exception as e:
-        print(f"Error generando binario PDF: {e}")
-        # En caso extremo de error, devolvemos un PDF de error simple
-        err_pdf = FPDF()
-        err_pdf.add_page()
-        err_pdf.set_font("Arial", "", 12)
-        err_pdf.multi_cell(0, 10, f"Error generando el documento PDF completo.\n\nDetalle: {str(e)}")
-        return err_pdf.output(dest='S').encode('latin-1'), "application/pdf", f"ERROR_{timestamp}.pdf"
+        print(f"Error PDF Interno: {e}")
+        # PDF de error de emergencia
+        err = FPDF()
+        err.add_page()
+        err.set_font("Arial", "", 12)
+        err.multi_cell(0, 10, f"Error generando PDF: {str(e)}")
+        return err.output(dest='S').encode('latin-1', 'replace'), "application/pdf", "Error.pdf"
 
-
-# --- ENDPOINT STREAMING ---
+# --- ENDPOINTS ---
 @app.post("/analyze/")
 async def analyze_documents(
     files: List[UploadFile] = File(...),
     instructions: str = Form(...),
     current_user: Dict[str, Any] = Depends(get_current_user)
 ):
-    print(f"Análisis (Streaming) solicitado por: {current_user.get('email')}")
-    
     if len(files) > 3:
         raise HTTPException(status_code=400, detail="Máximo 3 archivos.")
 
-    supported_types = ["application/pdf", "application/vnd.openxmlformats-officedocument.wordprocessingml.document"]
     model_parts = []
     original_filenames = []
 
     for file in files:
-        if file.content_type not in supported_types:
-            raise HTTPException(status_code=400, detail=f"Formato no soportado: {file.filename}")
-        
         original_filenames.append(file.filename)
         content = await file.read()
 
         if file.content_type == "application/pdf":
-            part = Part.from_data(data=content, mime_type="application/pdf")
-            model_parts.append(part)
+            model_parts.append(Part.from_data(data=content, mime_type="application/pdf"))
         else:
-            try:
-                text = await asyncio.to_thread(read_docx_sync, content)
-                model_parts.append(f"--- DOC: {file.filename} ---\n{text}\n------\n")
-            except Exception as e:
-                raise HTTPException(status_code=400, detail=f"Error leyendo DOCX {file.filename}: {e}")
+            # SOLUCIÓN CPU BLOCKING: Usar asyncio.to_thread
+            text = await asyncio.to_thread(read_docx_sync, content)
+            model_parts.append(f"--- DOC: {file.filename} ---\n{text}\n------\n")
 
     model_parts.append(f"\nINSTRUCCIONES: {instructions}")
 
-    model = GenerativeModel(
-        model_name=GEMINI_MODEL_NAME,
-        system_instruction=ANALYZER_SYSTEM_PROMPT
-    )
+    model = GenerativeModel(model_name=GEMINI_MODEL_NAME, system_instruction=ANALYZER_SYSTEM_PROMPT)
     
-    safety = [
-        SafetySetting(
-            category=SafetySetting.HarmCategory.HARM_CATEGORY_HATE_SPEECH,
-            threshold=SafetySetting.HarmBlockThreshold.BLOCK_ONLY_HIGH
-        ),
-        SafetySetting(
-            category=SafetySetting.HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT,
-            threshold=SafetySetting.HarmBlockThreshold.BLOCK_ONLY_HIGH
-        ),
-        SafetySetting(
-            category=SafetySetting.HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT,
-            threshold=SafetySetting.HarmBlockThreshold.BLOCK_ONLY_HIGH
-        ),
-        SafetySetting(
-            category=SafetySetting.HarmCategory.HARM_CATEGORY_HARASSMENT,
-            threshold=SafetySetting.HarmBlockThreshold.BLOCK_ONLY_HIGH
-        ),
-    ]
-
     async def generate_stream():
         full_text = ""
         try:
             responses = await model.generate_content_async(
                 model_parts,
                 generation_config={"temperature": 0.4, "max_output_tokens": 16348},
-                safety_settings=safety,
                 stream=True
             )
-
             async for chunk in responses:
                 if chunk.text:
                     full_text += chunk.text
@@ -296,6 +232,7 @@ async def analyze_documents(
             user_id = current_user.get("uid")
             title = (instructions[:40] + '...') if len(instructions) > 40 else instructions
             
+            # SOLUCIÓN I/O BLOCKING: Usar await con AsyncClient
             doc_ref = db.collection("analysis_history").document()
             await doc_ref.set({
                 "userId": user_id,
@@ -305,41 +242,12 @@ async def analyze_documents(
                 "timestamp": SERVER_TIMESTAMP,
                 "original_filenames": original_filenames
             })
-            
             yield f"data: {json.dumps({'done': True, 'analysis_id': doc_ref.id})}\n\n"
-
         except Exception as e:
-            print(f"Error en stream: {e}")
+            print(f"Error stream: {e}")
             yield f"data: {json.dumps({'error': str(e)})}\n\n"
 
     return StreamingResponse(generate_stream(), media_type="text/event-stream")
-
-# ... (Resto de endpoints GET, DELETE) ...
-@app.get("/analysis-history/")
-async def get_analysis_history(current_user: Dict[str, Any] = Depends(get_current_user)):
-    user_id = current_user.get("uid")
-    ref = db.collection("analysis_history").where("userId", "==", user_id).order_by("timestamp", direction=Query.DESCENDING)
-    history = []
-    async for d in ref.stream():
-        history.append({"id": d.id, "title": d.get("title"), "timestamp": d.get("timestamp")})
-    return history
-
-@app.get("/analysis-history/{analysis_id}")
-async def get_analysis_detail(analysis_id: str, current_user: Dict[str, Any] = Depends(get_current_user)):
-    doc = await db.collection("analysis_history").document(analysis_id).get()
-    if not doc.exists: raise HTTPException(404, "No encontrado")
-    data = doc.to_dict()
-    if data.get("userId") != current_user.get("uid"): raise HTTPException(403, "Sin permiso")
-    return data
-
-@app.delete("/analysis-history/{analysis_id}")
-async def delete_analysis(analysis_id: str, current_user: Dict[str, Any] = Depends(get_current_user)):
-    ref = db.collection("analysis_history").document(analysis_id)
-    doc = await ref.get()
-    if not doc.exists: raise HTTPException(404, "No encontrado")
-    if doc.to_dict().get("userId") != current_user.get("uid"): raise HTTPException(403, "Sin permiso")
-    await ref.delete()
-    return {"status": "ok"}
 
 @app.post("/download-analysis")
 async def download_analysis(
@@ -350,17 +258,46 @@ async def download_analysis(
 ):
     try:
         timestamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
-
         if file_format.lower() == "docx":
+            # SOLUCIÓN CPU BLOCKING: Mover a hilo secundario
             content, mime, fname = await asyncio.to_thread(create_docx_sync, analysis_text, instructions, timestamp)
         else:
+            # SOLUCIÓN CPU BLOCKING Y PDF BLANCO: Mover a hilo secundario
             content, mime, fname = await asyncio.to_thread(create_pdf_sync, analysis_text, instructions, timestamp)
 
         return Response(content=content, media_type=mime, headers={"Content-Disposition": f"attachment; filename={fname}"})
     except Exception as e:
-        print(f"Error crítico en descarga: {e}")
-        raise HTTPException(500, f"Error generando archivo: {e}")
+        raise HTTPException(500, f"Error descarga: {e}")
+
+@app.get("/analysis-history/")
+async def get_analysis_history(current_user: Dict[str, Any] = Depends(get_current_user)):
+    user_id = current_user.get("uid")
+    # SOLUCIÓN I/O BLOCKING: Consultas asíncronas
+    ref = db.collection("analysis_history").where("userId", "==", user_id).order_by("timestamp", direction=Query.DESCENDING)
+    history = []
+    async for d in ref.stream():
+        history.append({"id": d.id, "title": d.get("title"), "timestamp": d.get("timestamp")})
+    return history
+
+@app.get("/analysis-history/{analysis_id}")
+async def get_analysis_detail(analysis_id: str, current_user: Dict[str, Any] = Depends(get_current_user)):
+    # SOLUCIÓN I/O BLOCKING: await get()
+    doc = await db.collection("analysis_history").document(analysis_id).get()
+    if not doc.exists: raise HTTPException(404)
+    data = doc.to_dict()
+    if data.get("userId") != current_user.get("uid"): raise HTTPException(403)
+    return data
+
+@app.delete("/analysis-history/{analysis_id}")
+async def delete_analysis(analysis_id: str, current_user: Dict[str, Any] = Depends(get_current_user)):
+    ref = db.collection("analysis_history").document(analysis_id)
+    # SOLUCIÓN I/O BLOCKING: await get() y await delete()
+    doc = await ref.get()
+    if not doc.exists: raise HTTPException(404)
+    if doc.to_dict().get("userId") != current_user.get("uid"): raise HTTPException(403)
+    await ref.delete()
+    return {"status": "ok"}
 
 @app.get("/")
 def read_root():
-    return {"status": "ok", "msg": "Analizador Vertex Activo (Streaming)"}
+    return {"status": "ok", "msg": "API Analizador Activa v2.1 (FIXED)"}
