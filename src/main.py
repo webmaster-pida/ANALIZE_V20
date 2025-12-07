@@ -6,6 +6,7 @@ import json
 import io
 import re
 import asyncio
+from pathlib import Path
 from fastapi import FastAPI, File, Form, UploadFile, HTTPException, Response, Depends
 from fastapi.middleware.cors import CORSMiddleware
 # Importamos StreamingResponse para el efecto "poco a poco"
@@ -29,6 +30,11 @@ from src.core.prompts import ANALYZER_SYSTEM_PROMPT
 
 # Cargar variables
 load_dotenv()
+
+# --- CONFIGURACIÓN DE RUTAS ---
+# Definir el directorio base para encontrar las fuentes de forma segura
+BASE_DIR = Path(__file__).resolve().parent.parent
+FONTS_DIR = BASE_DIR / "fonts"
 
 # --- CONFIGURACIÓN VERTEX AI ---
 try:
@@ -89,9 +95,30 @@ def parse_and_add_markdown_to_docx(document, markdown_text):
                 else:
                     p.add_run(part)
 
+def sanitize_text_for_pdf(text: str) -> str:
+    """
+    Limpia caracteres que suelen romper FPDF cuando no se usa Unicode completo
+    o reemplaza viñetas markdown por guiones simples.
+    """
+    if not text:
+        return ""
+    # Reemplazos comunes para evitar UnicodeEncodeError en fuentes estándar
+    replacements = {
+        "•": "-",
+        "—": "-",
+        "“": '"',
+        "”": '"',
+        "‘": "'",
+        "’": "'",
+        "…": "..."
+    }
+    for char, replacement in replacements.items():
+        text = text.replace(char, replacement)
+    return text
+
 class PDF(FPDF):
     def header(self):
-        # Se mantiene Arial para la cabecera por ser la más estable
+        # Usamos Arial para el header para máxima compatibilidad
         self.set_font("Arial", "B", 15)
         self.set_text_color(29, 53, 87)
         self.cell(0, 10, "PIDA-AI: Resumen de Consulta", 0, 1, "L")
@@ -107,15 +134,13 @@ class PDF(FPDF):
         self.cell(0, 10, f"Página {self.page_no()}/{{nb}}", 0, 0, "C")
 
 
-# --- UTILIDADES ASÍNCRONAS PARA PROCESAMIENTO/DESCARGA (to_thread helpers) ---
+# --- UTILIDADES ASÍNCRONAS PARA PROCESAMIENTO/DESCARGA ---
 
 def read_docx_sync(content: bytes) -> str:
-    """Función síncrona para leer el contenido de un DOCX (CPU-Bound)."""
     doc = Document(io.BytesIO(content))
     return "\n".join([p.text for p in doc.paragraphs])
 
 def create_docx_sync(analysis_text: str, instructions: str, timestamp: str) -> tuple[bytes, str, str]:
-    """Función síncrona para generar el archivo DOCX (CPU-Bound)."""
     stream = io.BytesIO()
     doc = Document()
     try:
@@ -134,55 +159,64 @@ def create_docx_sync(analysis_text: str, instructions: str, timestamp: str) -> t
     return stream.read(), mime, fname
 
 def create_pdf_sync(analysis_text: str, instructions: str, timestamp: str) -> tuple[bytes, str, str]:
-    """Función síncrona para generar el archivo PDF (CPU-Bound)."""
     pdf = PDF()
     
-    # CORREGIDO: Reintroducir la carga de fuente Unicode aquí.
-    # Esto es vital para que multi_cell pueda renderizar correctamente texto no-ASCII.
+    # 1. Intentar cargar fuentes Unicode usando rutas absolutas
+    font_used = "Arial" # Fallback por defecto
     try:
-        # Se asume que estos archivos están accesibles.
-        pdf.add_font("NotoSans", "", "fonts/NotoSans-Regular.ttf", uni=True)
-        pdf.add_font("NotoSans", "B", "fonts/NotoSans-Bold.ttf", uni=True)
-        pdf_font = "NotoSans"
+        regular_font = FONTS_DIR / "NotoSans-Regular.ttf"
+        bold_font = FONTS_DIR / "NotoSans-Bold.ttf"
+        
+        if regular_font.exists() and bold_font.exists():
+            pdf.add_font("NotoSans", "", str(regular_font), uni=True)
+            pdf.add_font("NotoSans", "B", str(bold_font), uni=True)
+            font_used = "NotoSans"
+        else:
+            print(f"Advertencia: Fuentes no encontradas en {FONTS_DIR}")
     except Exception as e:
-        # Fallback a Arial si la fuente personalizada falla.
-        # Imprimir el error es útil para el debug en el entorno.
-        print(f"Advertencia: No se pudieron cargar las fuentes NotoSans. Usando Arial. Error: {e}")
-        pdf_font = "Arial"
-    
+        print(f"Advertencia: Error cargando fuentes ({e}). Usando Arial.")
+
+    # Si estamos usando Arial (porque falló NotoSans), debemos limpiar el texto de caracteres Unicode complejos
+    if font_used == "Arial":
+        analysis_text = sanitize_text_for_pdf(analysis_text)
+        instructions = sanitize_text_for_pdf(instructions)
+
     pdf.alias_nb_pages()
     pdf.add_page()
     
-    # Usar la fuente determinada (NotoSans o Arial)
-    pdf.set_font(pdf_font, "B", 12)
-
+    # Instrucciones
+    pdf.set_font(font_used, "B", 12)
     pdf.cell(0, 10, "Instrucciones", 0, 1)
     
-    pdf.set_font(pdf_font, "", 11)
-        
+    pdf.set_font(font_used, "", 11)
     pdf.multi_cell(0, 6, instructions)
     pdf.ln(5)
     
-    pdf.set_font(pdf_font, "B", 12)
-        
+    # Análisis
+    pdf.set_font(font_used, "B", 12)
     pdf.cell(0, 10, "Análisis", 0, 1)
     
-    pdf.set_font(pdf_font, "", 11)
-    
-    stream = io.BytesIO()
-    
-    # Se usa multi_cell que es más estable para volcar grandes bloques de texto.
+    pdf.set_font(font_used, "", 11)
+    # Usamos multi_cell directo para garantizar que el texto se escriba
     pdf.multi_cell(0, 6, analysis_text)
     
-    # pdf.output(dest='S') es la operación CPU-Bound que devuelve el contenido
-    # Se mantiene la codificación latin1 para compatibilidad con fpdf base,
-    # el parámetro uni=True en add_font (si funciona) debería encargarse del Unicode.
-    stream.write(pdf.output(dest='S').encode('latin1', 'ignore'))
-    stream.seek(0)
-    
-    mime = "application/pdf"
-    fname = f"PIDA_{timestamp}.pdf"
-    return stream.read(), mime, fname
+    # Generar salida
+    try:
+        # FPDF output(dest='S') devuelve string latin-1. Encoding a bytes.
+        pdf_content = pdf.output(dest='S').encode('latin-1', 'ignore')
+        
+        stream = io.BytesIO(pdf_content)
+        mime = "application/pdf"
+        fname = f"PIDA_{timestamp}.pdf"
+        return stream.read(), mime, fname
+    except Exception as e:
+        print(f"Error generando binario PDF: {e}")
+        # En caso extremo de error, devolvemos un PDF de error simple
+        err_pdf = FPDF()
+        err_pdf.add_page()
+        err_pdf.set_font("Arial", "", 12)
+        err_pdf.multi_cell(0, 10, f"Error generando el documento PDF completo.\n\nDetalle: {str(e)}")
+        return err_pdf.output(dest='S').encode('latin-1'), "application/pdf", f"ERROR_{timestamp}.pdf"
 
 
 # --- ENDPOINT STREAMING ---
@@ -201,7 +235,6 @@ async def analyze_documents(
     model_parts = []
     original_filenames = []
 
-    # 1. Procesar archivos (Leemos en memoria antes de empezar el stream)
     for file in files:
         if file.content_type not in supported_types:
             raise HTTPException(status_code=400, detail=f"Formato no soportado: {file.filename}")
@@ -214,7 +247,6 @@ async def analyze_documents(
             model_parts.append(part)
         else:
             try:
-                # Usar asyncio.to_thread para no bloquear el Event Loop con docx
                 text = await asyncio.to_thread(read_docx_sync, content)
                 model_parts.append(f"--- DOC: {file.filename} ---\n{text}\n------\n")
             except Exception as e:
@@ -222,7 +254,6 @@ async def analyze_documents(
 
     model_parts.append(f"\nINSTRUCCIONES: {instructions}")
 
-    # 2. Configurar Modelo
     model = GenerativeModel(
         model_name=GEMINI_MODEL_NAME,
         system_instruction=ANALYZER_SYSTEM_PROMPT
@@ -247,11 +278,9 @@ async def analyze_documents(
         ),
     ]
 
-    # 3. Generador Asíncrono para Streaming
     async def generate_stream():
         full_text = ""
         try:
-            # Usamos generate_content_async con stream=True
             responses = await model.generate_content_async(
                 model_parts,
                 generation_config={"temperature": 0.4, "max_output_tokens": 16348},
@@ -262,51 +291,41 @@ async def analyze_documents(
             async for chunk in responses:
                 if chunk.text:
                     full_text += chunk.text
-                    # Enviamos formato SSE (Server-Sent Events)
                     yield f"data: {json.dumps({'text': chunk.text})}\n\n"
             
-            # Al terminar, guardamos en Firestore
             user_id = current_user.get("uid")
             title = (instructions[:40] + '...') if len(instructions) > 40 else instructions
             
             doc_ref = db.collection("analysis_history").document()
-            # Usar await con doc_ref.set()
             await doc_ref.set({
                 "userId": user_id,
                 "title": title,
                 "instructions": instructions,
                 "analysis": full_text,
-                "timestamp": SERVER_TIMESTAMP, # Usar SERVER_TIMESTAMP importado
+                "timestamp": SERVER_TIMESTAMP,
                 "original_filenames": original_filenames
             })
             
-            # Enviamos señal de fin con el ID del análisis
             yield f"data: {json.dumps({'done': True, 'analysis_id': doc_ref.id})}\n\n"
 
         except Exception as e:
             print(f"Error en stream: {e}")
             yield f"data: {json.dumps({'error': str(e)})}\n\n"
 
-    # Retornamos la respuesta como un stream de eventos
     return StreamingResponse(generate_stream(), media_type="text/event-stream")
 
-# ... (Resto de endpoints GET, DELETE, DOWNLOAD) ...
+# ... (Resto de endpoints GET, DELETE) ...
 @app.get("/analysis-history/")
 async def get_analysis_history(current_user: Dict[str, Any] = Depends(get_current_user)):
     user_id = current_user.get("uid")
-    # Usar Query.DESCENDING importado
     ref = db.collection("analysis_history").where("userId", "==", user_id).order_by("timestamp", direction=Query.DESCENDING)
-    
     history = []
-    # Usar async for en el stream del AsyncClient
     async for d in ref.stream():
         history.append({"id": d.id, "title": d.get("title"), "timestamp": d.get("timestamp")})
-        
     return history
 
 @app.get("/analysis-history/{analysis_id}")
 async def get_analysis_detail(analysis_id: str, current_user: Dict[str, Any] = Depends(get_current_user)):
-    # Usar await con doc.get()
     doc = await db.collection("analysis_history").document(analysis_id).get()
     if not doc.exists: raise HTTPException(404, "No encontrado")
     data = doc.to_dict()
@@ -316,11 +335,9 @@ async def get_analysis_detail(analysis_id: str, current_user: Dict[str, Any] = D
 @app.delete("/analysis-history/{analysis_id}")
 async def delete_analysis(analysis_id: str, current_user: Dict[str, Any] = Depends(get_current_user)):
     ref = db.collection("analysis_history").document(analysis_id)
-    # Usar await con doc.get()
     doc = await ref.get()
     if not doc.exists: raise HTTPException(404, "No encontrado")
     if doc.to_dict().get("userId") != current_user.get("uid"): raise HTTPException(403, "Sin permiso")
-    # Usar await con ref.delete()
     await ref.delete()
     return {"status": "ok"}
 
@@ -332,19 +349,16 @@ async def download_analysis(
     current_user: Dict[str, Any] = Depends(get_current_user)
 ):
     try:
-        # El formato incluye Año, Mes, Día, Hora, Minutos y Segundos (YYYY-MM-DD_HHMMSS)
-        timestamp = datetime.now().strftime("%Y-%m-%d_%H%M%S") 
+        timestamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
 
         if file_format.lower() == "docx":
-            # Mover la generación DOCX a un hilo secundario
             content, mime, fname = await asyncio.to_thread(create_docx_sync, analysis_text, instructions, timestamp)
         else:
-            # Mover la generación PDF a un hilo secundario
             content, mime, fname = await asyncio.to_thread(create_pdf_sync, analysis_text, instructions, timestamp)
 
-        # Retornar la respuesta con el contenido generado en el hilo
         return Response(content=content, media_type=mime, headers={"Content-Disposition": f"attachment; filename={fname}"})
     except Exception as e:
+        print(f"Error crítico en descarga: {e}")
         raise HTTPException(500, f"Error generando archivo: {e}")
 
 @app.get("/")
