@@ -321,7 +321,7 @@ async def get_analysis_history(current_user: Dict[str, Any] = Depends(get_curren
     ref = db.collection("analysis_history").where("userId", "==", user_id).order_by("timestamp", direction=Query.DESCENDING)
     history = []
     async for d in ref.stream():
-        history.append({"id": d.id, "title": d.get("title"), "timestamp": d.get("timestamp")})
+        history.append({"id": d.id, "title": d.get("title"), "timestamp": d.get("timestamp"), "userId": user_id})
     return history
 
 @app.get("/analysis-history/{analysis_id}")
