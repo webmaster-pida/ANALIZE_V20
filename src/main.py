@@ -1,5 +1,3 @@
-# /src/main.py
-
 import os
 import json
 import io
@@ -44,6 +42,12 @@ if PROJECT_ID:
 db = AsyncClient(project=PROJECT_ID)
 
 app = FastAPI(title="PIDA Document Analyzer (Streaming)")
+
+# --- CONFIGURACIÓN DE SEGURIDAD (NUEVO) ---
+try:
+    MAX_FILE_SIZE_MB = int(os.getenv("MAX_FILE_SIZE_MB", "10"))
+except ValueError:
+    MAX_FILE_SIZE_MB = 10
 
 # --- CORS ---
 raw_origins = os.getenv("ALLOWED_ORIGINS", '["https://pida-ai.com"]')
@@ -260,9 +264,28 @@ async def analyze_documents(
     original_filenames = []
 
     for file in files:
-        original_filenames.append(file.filename)
+        # --- CAMBIO 1: VALIDACIÓN DE TAMAÑO ---
+        file.file.seek(0, 2)
+        file_size = file.file.tell()
+        file.file.seek(0)
+        
+        if file_size > (MAX_FILE_SIZE_MB * 1024 * 1024):
+            raise HTTPException(400, f"El archivo {file.filename} excede el límite de {MAX_FILE_SIZE_MB}MB.")
+
+        # Leer contenido tras validar tamaño
         content = await file.read()
-        if file.content_type == "application/pdf":
+
+        # --- CAMBIO 2: VALIDACIÓN MAGIC BYTES ---
+        is_pdf = content.startswith(b'%PDF')
+        is_docx = content.startswith(b'PK\x03\x04')
+
+        if not (is_pdf or is_docx):
+             raise HTTPException(400, f"El archivo {file.filename} no es un PDF o DOCX válido.")
+
+        original_filenames.append(file.filename)
+
+        # Procesar según el tipo detectado (no el content-type)
+        if is_pdf:
             model_parts.append(Part.from_data(data=content, mime_type="application/pdf"))
         else:
             text = await asyncio.to_thread(read_docx_sync, content)
