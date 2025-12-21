@@ -14,7 +14,13 @@ from datetime import datetime
 from google.cloud.firestore import AsyncClient, SERVER_TIMESTAMP, Query
 import google.auth
 import vertexai
-from vertexai.generative_models import GenerativeModel, Part, SafetySetting
+from vertexai.generative_models import (
+    GenerativeModel, 
+    Part, 
+    SafetySetting, 
+    HarmCategory, 
+    HarmBlockThreshold
+)
 from src.core.security import get_current_user
 from src.core.prompts import ANALYZER_SYSTEM_PROMPT
 
@@ -295,12 +301,44 @@ async def analyze_documents(
     model_parts.append(f"\nINSTRUCCIONES: {instructions}")
     model = GenerativeModel(model_name=GEMINI_MODEL_NAME, system_instruction=ANALYZER_SYSTEM_PROMPT)
     
+    # --- CONFIGURACIÓN DE SEGURIDAD CRÍTICA ---
+    # Desactiva los filtros para evitar que el modelo corte el texto 
+    # al detectar términos sensibles (violencia, delitos) comunes en DDHH.
+    safety_settings = [
+        SafetySetting(
+            category=HarmCategory.HARM_CATEGORY_HATE_SPEECH,
+            threshold=HarmBlockThreshold.BLOCK_NONE
+        ),
+        SafetySetting(
+            category=HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT,
+            threshold=HarmBlockThreshold.BLOCK_NONE
+        ),
+        SafetySetting(
+            category=HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT,
+            threshold=HarmBlockThreshold.BLOCK_NONE
+        ),
+        SafetySetting(
+            category=HarmCategory.HARM_CATEGORY_HARASSMENT,
+            threshold=HarmBlockThreshold.BLOCK_NONE
+        ),
+    ]
+
+    # --- CONFIGURACIÓN DE GENERACIÓN ---
+    # Utiliza las variables de entorno para temp y top_p.
+    # Mantiene 16k tokens (soportados por Gemini 2.5 Flash que llega a 65k).
+    gen_config = {
+        "temperature": float(os.getenv("GEMINI_TEMP", "0.4")),
+        "top_p": float(os.getenv("GEMINI_TOP_P", "0.95")),
+        "max_output_tokens": 16348
+    }
+
     async def generate_stream():
         full_text = ""
         try:
             responses = await model.generate_content_async(
                 model_parts, 
-                generation_config={"temperature": 0.4, "max_output_tokens": 16348}, 
+                generation_config=gen_config, 
+                safety_settings=safety_settings, # <--- IMPORTANTE: Se pasan los filtros desactivados
                 stream=True
             )
             async for chunk in responses:
