@@ -1,3 +1,5 @@
+# src/main.py
+
 import os
 import json
 import io
@@ -65,7 +67,6 @@ except:
 app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,
-    # Modificado para aceptar Firebase Y Codespaces dinámicos
     allow_origin_regex=r"https://pida-ai-v20--.*\.web\.app$|https://.*\.app\.github\.dev$",
     allow_credentials=True,
     allow_methods=["*"],
@@ -73,18 +74,49 @@ app.add_middleware(
     expose_headers=["Content-Disposition"],
 )
 
+# --- FUNCIÓN DE VERIFICACIÓN DE SUSCRIPCIÓN (NUEVA) ---
+async def verify_active_subscription(current_user: Dict[str, Any]):
+    """
+    Verifica si el usuario es VIP o tiene una suscripción activa en Stripe.
+    """
+    user_id = current_user.get("uid")
+    user_email = current_user.get("email", "").strip().lower()
+    
+    # 1. Comprobar si es VIP (Listas blancas desde variables de entorno)
+    raw_domains = os.getenv("ADMIN_DOMAINS", '[]')
+    raw_emails = os.getenv("ADMIN_EMAILS", '[]')
+    try:
+        allowed_domains = [str(d).strip().lower() for d in json.loads(raw_domains)]
+        allowed_emails = [str(e).strip().lower() for e in json.loads(raw_emails)]
+    except:
+        allowed_domains, allowed_emails = [], []
+
+    email_domain = user_email.split("@")[-1] if "@" in user_email else ""
+    if (email_domain in allowed_domains) or (user_email in allowed_emails):
+        return # Acceso VIP concedido, no necesita Stripe
+
+    # 2. Comprobar suscripción en Firestore (Colección de Stripe Extension)
+    try:
+        subscriptions_ref = db.collection("customers").document(user_id).collection("subscriptions")
+        query = subscriptions_ref.where("status", "in", ["active", "trialing"]).limit(1)
+        results = [doc async for doc in query.stream()]
+        
+        if not results:
+            raise HTTPException(status_code=403, detail="No tienes una suscripción activa.")
+    except HTTPException as he:
+        raise he
+    except Exception as e:
+        print(f"Error verificando suscripción Stripe: {e}")
+        raise HTTPException(status_code=500, detail="Error interno verificando suscripción.")
+
 # --- UTILIDADES DE NOMBRE DE ARCHIVO ---
 def generate_filename(instructions: str, extension: str) -> str:
     """Genera un nombre de archivo basado en el título y fecha exacta."""
-    # 1. Limpiar título (primeros 40 caracteres, solo alfanuméricos)
     safe_title = re.sub(r'[^a-zA-Z0-9áéíóúÁÉÍÓÚñÑ ]', '', instructions[:40])
     safe_title = safe_title.strip().replace(' ', '_')
     if not safe_title:
         safe_title = "Analisis_PIDA"
-    
-    # 2. Fecha formato: año-mes-día-hora-segundos
     timestamp = datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
-    
     return f"{safe_title}_{timestamp}.{extension}"
 
 # --- UTILIDADES DE LIMPIEZA TEXTO ---
@@ -105,38 +137,33 @@ def write_markdown_to_pdf(pdf, text):
     Escribe texto en el PDF interpretando Markdown básico (## Títulos y **Negritas**)
     para que no salgan los asteriscos.
     """
-    # Asegurar fuente base
     pdf.set_font("Arial", "", 11)
     
     for line in text.split('\n'):
         line = line.strip()
         if not line:
-            pdf.ln(5) # Espacio entre párrafos
+            pdf.ln(5)
             continue
             
-        # 1. Encabezados (## o #)
         if line.startswith('## '):
             pdf.ln(3)
             pdf.set_font("Arial", "B", 13)
-            pdf.set_text_color(29, 53, 87) # Navy
+            pdf.set_text_color(29, 53, 87)
             pdf.multi_cell(0, 8, line.replace('## ', ''))
-            pdf.set_text_color(0, 0, 0) # Reset color
+            pdf.set_text_color(0, 0, 0)
             pdf.set_font("Arial", "", 11)
         elif line.startswith('# '):
             pdf.ln(5)
             pdf.set_font("Arial", "B", 15)
-            pdf.set_text_color(185, 47, 50) # Pida Red
+            pdf.set_text_color(185, 47, 50)
             pdf.multi_cell(0, 10, line.replace('# ', ''))
             pdf.set_text_color(0, 0, 0)
             pdf.set_font("Arial", "", 11)
             
-        # 2. Listas (* o -)
         elif line.startswith('* ') or line.startswith('- '):
-            pdf.set_x(15) # Sangría para viñeta
-            clean_line = line[2:] # Quitar el *
-            pdf.write(6, "- ") # Escribir viñeta estándar
-            
-            # Procesar negritas dentro de la línea de lista
+            pdf.set_x(15)
+            clean_line = line[2:]
+            pdf.write(6, "- ")
             parts = re.split(r'(\*\*.*?\*\*)', clean_line)
             for part in parts:
                 if part.startswith('**') and part.endswith('**'):
@@ -147,7 +174,6 @@ def write_markdown_to_pdf(pdf, text):
                     pdf.write(6, part)
             pdf.ln(6)
 
-        # 3. Párrafo normal (con posibles negritas)
         else:
             parts = re.split(r'(\*\*.*?\*\*)', line)
             for part in parts:
@@ -215,40 +241,26 @@ def create_docx_sync(analysis_text: str, instructions: str) -> tuple[bytes, str,
     return stream.read(), "application/vnd.openxmlformats-officedocument.wordprocessingml.document", fname
 
 def create_pdf_sync(analysis_text: str, instructions: str) -> tuple[bytes, str, str]:
-    # 1. Limpieza de caracteres
     safe_inst = sanitize_text_for_pdf(instructions)
     safe_ana = sanitize_text_for_pdf(analysis_text)
-
     pdf = PDF()
     pdf.alias_nb_pages()
     pdf.add_page()
-    
-    # Instrucciones
     pdf.set_font("Arial", "B", 12)
     pdf.cell(0, 10, "Instrucciones", 0, 1)
     pdf.set_font("Arial", "", 11)
     pdf.multi_cell(0, 6, safe_inst)
     pdf.ln(5)
-    
-    # Análisis (Usando el parser manual de Markdown)
     pdf.set_font("Arial", "B", 12)
     pdf.cell(0, 10, "Analisis", 0, 1)
-    
     if not safe_ana.strip():
         pdf.set_font("Arial", "I", 11)
         pdf.multi_cell(0, 6, "[Sin contenido]")
     else:
-        # Aquí usamos la función que interpreta **negritas** y ## títulos
         write_markdown_to_pdf(pdf, safe_ana)
-    
-    # Generar salida bytes
     try:
         pdf_string = pdf.output(dest='S')
-        if isinstance(pdf_string, str):
-            pdf_bytes = pdf_string.encode('latin-1', 'replace')
-        else:
-            pdf_bytes = pdf_string
-        
+        pdf_bytes = pdf_string.encode('latin-1', 'replace') if isinstance(pdf_string, str) else pdf_string
         stream = io.BytesIO(pdf_bytes)
         fname = generate_filename(instructions, "pdf")
         return stream.read(), "application/pdf", fname
@@ -266,32 +278,23 @@ async def analyze_documents(
     instructions: str = Form(...),
     current_user: Dict[str, Any] = Depends(get_current_user)
 ):
+    await verify_active_subscription(current_user) # <--- VALIDACIÓN ACTIVA
     if len(files) > 3: raise HTTPException(400, "Máximo 3 archivos.")
     model_parts = []
     original_filenames = []
 
     for file in files:
-        # --- CAMBIO 1: VALIDACIÓN DE TAMAÑO ---
         file.file.seek(0, 2)
         file_size = file.file.tell()
         file.file.seek(0)
-        
         if file_size > (MAX_FILE_SIZE_MB * 1024 * 1024):
             raise HTTPException(400, f"El archivo {file.filename} excede el límite de {MAX_FILE_SIZE_MB}MB.")
-
-        # Leer contenido tras validar tamaño
         content = await file.read()
-
-        # --- CAMBIO 2: VALIDACIÓN MAGIC BYTES ---
         is_pdf = content.startswith(b'%PDF')
         is_docx = content.startswith(b'PK\x03\x04')
-
         if not (is_pdf or is_docx):
              raise HTTPException(400, f"El archivo {file.filename} no es un PDF o DOCX válido.")
-
         original_filenames.append(file.filename)
-
-        # Procesar según el tipo detectado (no el content-type)
         if is_pdf:
             model_parts.append(Part.from_data(data=content, mime_type="application/pdf"))
         else:
@@ -301,31 +304,13 @@ async def analyze_documents(
     model_parts.append(f"\nINSTRUCCIONES: {instructions}")
     model = GenerativeModel(model_name=GEMINI_MODEL_NAME, system_instruction=ANALYZER_SYSTEM_PROMPT)
     
-    # --- CONFIGURACIÓN DE SEGURIDAD CRÍTICA ---
-    # Desactiva los filtros para evitar que el modelo corte el texto 
-    # al detectar términos sensibles (violencia, delitos) comunes en DDHH.
     safety_settings = [
-        SafetySetting(
-            category=HarmCategory.HARM_CATEGORY_HATE_SPEECH,
-            threshold=HarmBlockThreshold.BLOCK_NONE
-        ),
-        SafetySetting(
-            category=HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT,
-            threshold=HarmBlockThreshold.BLOCK_NONE
-        ),
-        SafetySetting(
-            category=HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT,
-            threshold=HarmBlockThreshold.BLOCK_NONE
-        ),
-        SafetySetting(
-            category=HarmCategory.HARM_CATEGORY_HARASSMENT,
-            threshold=HarmBlockThreshold.BLOCK_NONE
-        ),
+        SafetySetting(category=HarmCategory.HARM_CATEGORY_HATE_SPEECH, threshold=HarmBlockThreshold.BLOCK_NONE),
+        SafetySetting(category=HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT, threshold=HarmBlockThreshold.BLOCK_NONE),
+        SafetySetting(category=HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT, threshold=HarmBlockThreshold.BLOCK_NONE),
+        SafetySetting(category=HarmCategory.HARM_CATEGORY_HARASSMENT, threshold=HarmBlockThreshold.BLOCK_NONE),
     ]
 
-    # --- CONFIGURACIÓN DE GENERACIÓN ---
-    # Utiliza las variables de entorno para temp y top_p.
-    # Mantiene 16k tokens (soportados por Gemini 2.5 Flash que llega a 65k).
     gen_config = {
         "temperature": float(os.getenv("GEMINI_TEMP", "0.4")),
         "top_p": float(os.getenv("GEMINI_TOP_P", "0.95")),
@@ -336,10 +321,7 @@ async def analyze_documents(
         full_text = ""
         try:
             responses = await model.generate_content_async(
-                model_parts, 
-                generation_config=gen_config, 
-                safety_settings=safety_settings, # <--- IMPORTANTE: Se pasan los filtros desactivados
-                stream=True
+                model_parts, generation_config=gen_config, safety_settings=safety_settings, stream=True
             )
             async for chunk in responses:
                 if chunk.text:
@@ -367,18 +349,19 @@ async def download_analysis(
     file_format: str = Form("docx"),
     current_user: Dict[str, Any] = Depends(get_current_user)
 ):
+    await verify_active_subscription(current_user) # <--- VALIDACIÓN ACTIVA
     try:
         if file_format.lower() == "docx":
             content, mime, fname = await asyncio.to_thread(create_docx_sync, analysis_text, instructions)
         else:
             content, mime, fname = await asyncio.to_thread(create_pdf_sync, analysis_text, instructions)
-            
         return Response(content=content, media_type=mime, headers={"Content-Disposition": f"attachment; filename={fname}"})
     except Exception as e:
         raise HTTPException(500, f"Error descarga: {e}")
 
 @app.get("/analysis-history/")
 async def get_analysis_history(current_user: Dict[str, Any] = Depends(get_current_user)):
+    await verify_active_subscription(current_user) # <--- VALIDACIÓN ACTIVA
     user_id = current_user.get("uid")
     ref = db.collection("analysis_history").where("userId", "==", user_id).order_by("timestamp", direction=Query.DESCENDING)
     history = []
@@ -388,6 +371,7 @@ async def get_analysis_history(current_user: Dict[str, Any] = Depends(get_curren
 
 @app.get("/analysis-history/{analysis_id}")
 async def get_analysis_detail(analysis_id: str, current_user: Dict[str, Any] = Depends(get_current_user)):
+    await verify_active_subscription(current_user) # <--- VALIDACIÓN ACTIVA
     doc = await db.collection("analysis_history").document(analysis_id).get()
     if not doc.exists: raise HTTPException(404)
     data = doc.to_dict()
@@ -396,6 +380,7 @@ async def get_analysis_detail(analysis_id: str, current_user: Dict[str, Any] = D
 
 @app.delete("/analysis-history/{analysis_id}")
 async def delete_analysis(analysis_id: str, current_user: Dict[str, Any] = Depends(get_current_user)):
+    await verify_active_subscription(current_user) # <--- VALIDACIÓN ACTIVA
     ref = db.collection("analysis_history").document(analysis_id)
     doc = await ref.get()
     if not doc.exists: raise HTTPException(404)
@@ -405,4 +390,4 @@ async def delete_analysis(analysis_id: str, current_user: Dict[str, Any] = Depen
 
 @app.get("/")
 def read_root():
-    return {"status": "ok", "msg": "API Analizador Activa v3.0 (PDF Formatted)"}
+    return {"status": "ok", "msg": "API Analizador Activa v3.0 (Stripe Enabled)"}
