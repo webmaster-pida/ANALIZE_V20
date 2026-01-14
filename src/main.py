@@ -12,7 +12,7 @@ from typing import List, Dict, Any
 from dotenv import load_dotenv
 from docx import Document
 from fpdf import FPDF
-from datetime import datetime
+from datetime import datetime, timezone
 from google.cloud.firestore import AsyncClient, SERVER_TIMESTAMP, Query
 import google.auth
 import vertexai
@@ -49,6 +49,16 @@ if PROJECT_ID:
 # Inicializar Firestore
 db = AsyncClient(project=PROJECT_ID)
 
+# --- LÍMITES CONFIGURABLES (IGUAL QUE EN CHATv20) ---
+DAILY_LIMIT_BASICO = int(os.getenv("DAILY_LIMIT_BASICO", "3"))
+DOCS_LIMIT_BASICO = int(os.getenv("DOCS_LIMIT_BASICO", "1"))
+
+DAILY_LIMIT_AVANZADO = int(os.getenv("DAILY_LIMIT_AVANZADO", "15"))
+DOCS_LIMIT_AVANZADO = int(os.getenv("DOCS_LIMIT_AVANZADO", "3"))
+
+DAILY_LIMIT_PREMIUM = int(os.getenv("DAILY_LIMIT_PREMIUM", "25"))
+DOCS_LIMIT_PREMIUM = int(os.getenv("DOCS_LIMIT_PREMIUM", "5"))
+
 app = FastAPI(title="PIDA Document Analyzer (Streaming)")
 
 # --- CONFIGURACIÓN DE SEGURIDAD (NUEVO) ---
@@ -75,14 +85,14 @@ app.add_middleware(
 )
 
 # --- FUNCIÓN DE VERIFICACIÓN DE SUSCRIPCIÓN (NUEVA) ---
-async def verify_active_subscription(current_user: Dict[str, Any]):
+async def verify_active_subscription(current_user: Dict[str, Any]) -> str:
     """
-    Verifica si el usuario es VIP o tiene una suscripción activa en Stripe.
+    Verifica la suscripción y retorna el rol (demo, basico, avanzado, premium).
     """
     user_id = current_user.get("uid")
     user_email = current_user.get("email", "").strip().lower()
-    
-    # 1. Comprobar si es VIP (Listas blancas desde variables de entorno)
+
+    # 1. VIPs son Premium
     raw_domains = os.getenv("ADMIN_DOMAINS", '[]')
     raw_emails = os.getenv("ADMIN_EMAILS", '[]')
     try:
@@ -91,24 +101,21 @@ async def verify_active_subscription(current_user: Dict[str, Any]):
     except:
         allowed_domains, allowed_emails = [], []
 
-    email_domain = user_email.split("@")[-1] if "@" in user_email else ""
-    if (email_domain in allowed_domains) or (user_email in allowed_emails):
-        return # Acceso VIP concedido, no necesita Stripe
+    if (user_email.split("@")[-1] in allowed_domains) or (user_email in allowed_emails):
+        return "premium"
 
-    # 2. Comprobar suscripción en Firestore (Colección de Stripe Extension)
+    # 2. Verificar en Firestore (Colección de Stripe Extension)
     try:
         subscriptions_ref = db.collection("customers").document(user_id).collection("subscriptions")
         query = subscriptions_ref.where("status", "in", ["active", "trialing"]).limit(1)
         results = [doc async for doc in query.stream()]
-        
-        if not results:
-            raise HTTPException(status_code=403, detail="No tienes una suscripción activa.")
-    except HTTPException as he:
-        raise he
-    except Exception as e:
-        print(f"Error verificando suscripción Stripe: {e}")
-        raise HTTPException(status_code=500, detail="Error interno verificando suscripción.")
 
+        if not results:
+            return "demo"
+
+        return current_user.get("stripeRole", "basico").lower()
+    except Exception:
+        return "demo"
 # --- UTILIDADES DE NOMBRE DE ARCHIVO ---
 def generate_filename(instructions: str, extension: str) -> str:
     """Genera un nombre de archivo basado en el título y fecha exacta."""
@@ -278,8 +285,35 @@ async def analyze_documents(
     instructions: str = Form(...),
     current_user: Dict[str, Any] = Depends(get_current_user)
 ):
-    await verify_active_subscription(current_user) # <--- VALIDACIÓN ACTIVA
-    if len(files) > 3: raise HTTPException(400, "Máximo 3 archivos.")
+    # 1. Obtener rol y determinar sus límites
+    user_role = await verify_active_subscription(current_user)
+
+    if user_role == "demo":
+        raise HTTPException(status_code=403, detail="Tu plan actual (DEMO) no permite realizar análisis. Por favor, adquiere un plan.")
+
+    limits_map = {
+        "basico": (DAILY_LIMIT_BASICO, DOCS_LIMIT_BASICO),
+        "avanzado": (DAILY_LIMIT_AVANZADO, DOCS_LIMIT_AVANZADO),
+        "premium": (DAILY_LIMIT_PREMIUM, DOCS_LIMIT_PREMIUM)
+    }
+    daily_limit, docs_limit = limits_map.get(user_role, (0, 0))
+
+    # 2. Validar documentos simultáneos (Por análisis)
+    if len(files) > docs_limit:
+        raise HTTPException(400, f"Tu plan {user_role.upper()} solo permite {docs_limit} archivo(s) por análisis.")
+
+    # 3. Validar cuota diaria (Documento único por día)
+    today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    usage_ref = db.collection("users").document(current_user["uid"]).collection("usage_analizador").document(today_str)
+
+    usage_doc = await usage_ref.get()
+    count_today = usage_doc.to_dict().get("count", 0) if usage_doc.exists else 0
+
+    if count_today >= daily_limit:
+        raise HTTPException(status_code=429, detail=f"Has alcanzado el límite de {daily_limit} análisis diarios de tu plan {user_role.upper()}.")
+
+    # 4. Incrementar uso ANTES de procesar
+    await usage_ref.set({"count": count_today + 1}, merge=True)
     model_parts = []
     original_filenames = []
 
