@@ -8,13 +8,13 @@ import asyncio
 from fastapi import FastAPI, File, Form, UploadFile, HTTPException, Response, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse 
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 from dotenv import load_dotenv
 from docx import Document
 from fpdf import FPDF
 from datetime import datetime, timedelta, timezone
 from google.cloud.firestore import AsyncClient, SERVER_TIMESTAMP, Query
-from google.cloud import firestore
+from google.cloud import firestore # Para tipos como Increment
 import google.auth
 import vertexai
 from vertexai.generative_models import (
@@ -53,6 +53,7 @@ db = AsyncClient(project=PROJECT_ID)
 app = FastAPI(title="PIDA Document Analyzer (Streaming)")
 
 # --- VARIABLES DE LÍMITES (Desde Cloud Run) ---
+# Valores por defecto de seguridad
 LIMIT_BASICO_ANALYSIS_DAILY = int(os.getenv("LIMIT_BASICO_ANALYSIS_DAILY", 3))
 LIMIT_AVANZADO_ANALYSIS_DAILY = int(os.getenv("LIMIT_AVANZADO_ANALYSIS_DAILY", 15))
 LIMIT_PREMIUM_ANALYSIS_DAILY = int(os.getenv("LIMIT_PREMIUM_ANALYSIS_DAILY", 25))
@@ -61,66 +62,7 @@ LIMIT_BASICO_DOCS = int(os.getenv("LIMIT_BASICO_DOCS", 1))
 LIMIT_AVANZADO_DOCS = int(os.getenv("LIMIT_AVANZADO_DOCS", 3))
 LIMIT_PREMIUM_DOCS = int(os.getenv("LIMIT_PREMIUM_DOCS", 5))
 
-# --- MAPAS DE LÍMITES ---
-ANALYSIS_LIMITS = {
-    "basico": LIMIT_BASICO_ANALYSIS_DAILY,
-    "avanzado": LIMIT_AVANZADO_ANALYSIS_DAILY,
-    "premium": LIMIT_PREMIUM_ANALYSIS_DAILY,
-    "vip": -1  # Ilimitado
-}
-
-DOCS_LIMITS = {
-    "basico": LIMIT_BASICO_DOCS,
-    "avanzado": LIMIT_AVANZADO_DOCS,
-    "premium": LIMIT_PREMIUM_DOCS,
-    "vip": 100 
-}
-
-def get_date_utc_minus_6() -> str:
-    utc_now = datetime.now(timezone.utc)
-    cst_now = utc_now - timedelta(hours=6)
-    return cst_now.strftime('%Y-%m-%d')
-
-async def check_analysis_limits(user_id: str, plan: str, num_files: int):
-    plan_key = plan.lower().strip()
-    
-    # 1. VERIFICAR CANTIDAD DE ARCHIVOS
-    max_docs = DOCS_LIMITS.get(plan_key, 0)
-    
-    if max_docs != -1 and num_files > max_docs:
-        raise HTTPException(
-            status_code=403,
-            detail=f"Tu plan {plan_key.capitalize()} solo permite analizar {max_docs} documento(s) a la vez. Has subido {num_files}."
-        )
-
-    # 2. VERIFICAR USO DIARIO
-    limit_daily = ANALYSIS_LIMITS.get(plan_key, 0)
-    
-    if limit_daily == -1: return
-
-    today = get_date_utc_minus_6()
-    stats_ref = db.collection('users').document(user_id).collection('usage_stats').document(today)
-    doc = await stats_ref.get()
-    
-    current_count = 0
-    if doc.exists:
-        current_count = doc.to_dict().get('analysis_count', 0)
-        
-    if current_count >= limit_daily:
-        raise HTTPException(
-            status_code=429,
-            detail=f"Límite diario alcanzado para el plan {plan_key}"
-        )
-
-async def increment_analysis_count(user_id: str):
-    today = get_date_utc_minus_6()
-    stats_ref = db.collection('users').document(user_id).collection('usage_stats').document(today)
-    await stats_ref.set({
-        'analysis_count': firestore.Increment(1),
-        'last_updated': SERVER_TIMESTAMP
-    }, merge=True)
-
-# --- CONFIGURACIÓN DE SEGURIDAD (NUEVO) ---
+# --- CONFIGURACIÓN DE SEGURIDAD DE ARCHIVOS ---
 try:
     MAX_FILE_SIZE_MB = int(os.getenv("MAX_FILE_SIZE_MB", "10"))
 except ValueError:
@@ -143,40 +85,109 @@ app.add_middleware(
     expose_headers=["Content-Disposition"],
 )
 
-# --- FUNCIÓN DE VERIFICACIÓN DE SUSCRIPCIÓN (NUEVA) ---
-async def verify_active_subscription(current_user: Dict[str, Any]):
+# --- MAPAS DE LÍMITES ---
+ANALYSIS_LIMITS = {
+    "basico": LIMIT_BASICO_ANALYSIS_DAILY,
+    "avanzado": LIMIT_AVANZADO_ANALYSIS_DAILY,
+    "premium": LIMIT_PREMIUM_ANALYSIS_DAILY,
+    "vip": -1  # Ilimitado
+}
+
+DOCS_LIMITS = {
+    "basico": LIMIT_BASICO_DOCS,
+    "avanzado": LIMIT_AVANZADO_DOCS,
+    "premium": LIMIT_PREMIUM_DOCS,
+    "vip": 100 
+}
+
+# --- FUNCIONES DE UTILIDAD Y CONTROL ---
+
+def get_date_utc_minus_6() -> str:
+    """Devuelve la fecha actual ajustada a UTC-6"""
+    utc_now = datetime.now(timezone.utc)
+    cst_now = utc_now - timedelta(hours=6)
+    return cst_now.strftime('%Y-%m-%d')
+
+async def get_user_plan_unified(user_email: str, user_id: str) -> str:
     """
-    Verifica si el usuario es VIP o tiene una suscripción activa en Stripe.
+    Determina el plan del usuario unificando lógica VIP y DB.
+    Retorna: 'vip', 'basico', 'avanzado', 'premium' o 'none'.
     """
-    user_id = current_user.get("uid")
-    user_email = current_user.get("email", "").strip().lower()
+    user_email = user_email.strip().lower()
     
-    # 1. Comprobar si es VIP (Listas blancas desde variables de entorno)
-    raw_domains = os.getenv("ADMIN_DOMAINS", '[]')
-    raw_emails = os.getenv("ADMIN_EMAILS", '[]')
+    # 1. VERIFICACIÓN VIP (Variables de Entorno)
     try:
-        allowed_domains = [str(d).strip().lower() for d in json.loads(raw_domains)]
-        allowed_emails = [str(e).strip().lower() for e in json.loads(raw_emails)]
+        raw_domains = os.getenv("ADMIN_DOMAINS", '[]')
+        raw_emails = os.getenv("ADMIN_EMAILS", '[]')
+        admin_domains = [str(d).strip().lower() for d in json.loads(raw_domains)]
+        admin_emails = [str(e).strip().lower() for e in json.loads(raw_emails)]
     except:
-        allowed_domains, allowed_emails = [], []
+        admin_domains, admin_emails = [], []
 
     email_domain = user_email.split("@")[-1] if "@" in user_email else ""
-    if (email_domain in allowed_domains) or (user_email in allowed_emails):
-        return # Acceso VIP concedido, no necesita Stripe
+    if (email_domain in admin_domains) or (user_email in admin_emails):
+        return 'vip'
 
-    # 2. Comprobar suscripción en Firestore (Colección de Stripe Extension)
+    # 2. VERIFICACIÓN FIRESTORE (Documento de Cliente)
     try:
-        subscriptions_ref = db.collection("customers").document(user_id).collection("subscriptions")
-        query = subscriptions_ref.where("status", "in", ["active", "trialing"]).limit(1)
-        results = [doc async for doc in query.stream()]
-        
-        if not results:
-            raise HTTPException(status_code=403, detail="No tienes una suscripción activa.")
-    except HTTPException as he:
-        raise he
+        cust_doc = await db.collection('customers').document(user_id).get()
+        if cust_doc.exists:
+            data = cust_doc.to_dict()
+            status = data.get('status')
+            # Aceptamos active o trialing
+            if status in ['active', 'trialing']:
+                plan = data.get('plan', 'basico')
+                # Normalizamos nombres de plan
+                return plan.lower() if plan else 'basico'
     except Exception as e:
-        print(f"Error verificando suscripción Stripe: {e}")
-        raise HTTPException(status_code=500, detail="Error interno verificando suscripción.")
+        print(f"Error consultando plan en DB: {e}")
+        
+    return 'none' # Sin acceso
+
+async def check_analysis_access_and_limits(user_id: str, plan_key: str, num_files: int = 0, check_daily: bool = True):
+    """
+    Verifica si el plan permite operar y si cumple los límites.
+    Lanza HTTPException si falla.
+    """
+    if plan_key == 'none':
+        raise HTTPException(status_code=403, detail="No tienes un plan activo para realizar análisis.")
+
+    # 1. VERIFICAR CANTIDAD DE ARCHIVOS
+    if num_files > 0:
+        max_docs = DOCS_LIMITS.get(plan_key, 0)
+        if max_docs != -1 and num_files > max_docs:
+            raise HTTPException(
+                status_code=403,
+                detail=f"Tu plan {plan_key.capitalize()} solo permite analizar {max_docs} documento(s) a la vez."
+            )
+
+    # 2. VERIFICAR USO DIARIO
+    if check_daily:
+        limit_daily = ANALYSIS_LIMITS.get(plan_key, 0)
+        if limit_daily == -1: return # VIP Ilimitado
+
+        today = get_date_utc_minus_6()
+        stats_ref = db.collection('users').document(user_id).collection('usage_stats').document(today)
+        doc = await stats_ref.get()
+        
+        current_count = 0
+        if doc.exists:
+            current_count = doc.to_dict().get('analysis_count', 0)
+            
+        if current_count >= limit_daily:
+            raise HTTPException(
+                status_code=429,
+                detail=f"Límite diario alcanzado para el plan {plan_key}"
+            )
+
+async def increment_analysis_count(user_id: str):
+    """Incrementa el contador de uso"""
+    today = get_date_utc_minus_6()
+    stats_ref = db.collection('users').document(user_id).collection('usage_stats').document(today)
+    await stats_ref.set({
+        'analysis_count': firestore.Increment(1),
+        'last_updated': SERVER_TIMESTAMP
+    }, merge=True)
 
 # --- UTILIDADES DE NOMBRE DE ARCHIVO ---
 def generate_filename(instructions: str, extension: str) -> str:
@@ -347,42 +358,16 @@ async def analyze_documents(
     instructions: str = Form(...),
     current_user: Dict[str, Any] = Depends(get_current_user)
 ):
-    # 1. OBTENER PLAN USUARIO Y DETECTAR VIP (Variables de Entorno)
+    # 1. Obtener Plan del Usuario
     user_id = current_user['uid']
-    user_email = current_user.get('email', '').strip().lower()
-    user_plan = 'none'
+    user_email = current_user.get('email', '')
+    
+    plan = await get_user_plan_unified(user_email, user_id)
+    
+    # 2. Verificar Acceso y Límites
+    await check_analysis_access_and_limits(user_id, plan, len(files), check_daily=True)
 
-    # A. Chequeo VIP (Usando las mismas variables de entorno que verify_active_subscription)
-    try:
-        raw_domains = os.getenv("ADMIN_DOMAINS", '[]')
-        raw_emails = os.getenv("ADMIN_EMAILS", '[]')
-        admin_domains = [str(d).strip().lower() for d in json.loads(raw_domains)]
-        admin_emails = [str(e).strip().lower() for e in json.loads(raw_emails)]
-    except:
-        admin_domains, admin_emails = [], []
-
-    email_domain = user_email.split("@")[-1] if "@" in user_email else ""
-
-    if (email_domain in admin_domains) or (user_email in admin_emails):
-        user_plan = 'vip'
-    else:
-        # B. Chequeo Firestore (Plan Pagado)
-        try:
-            cust_doc = await db.collection('customers').document(user_id).get()
-            if cust_doc.exists:
-                data = cust_doc.to_dict()
-                if data.get('status') == 'active':
-                    user_plan = data.get('plan', 'basico')
-                    # Trial se mapea a básico para límites
-                    if data.get('has_trial'): user_plan = 'basico'
-        except Exception as e:
-            print(f"Error obteniendo plan: {e}")
-
-    # 2. VERIFICAR LÍMITES (Esto lanzará 403 o 429 si falla)
-    await check_analysis_limits(user_id, user_plan, len(files))
-
-    # --- LÓGICA DE ARCHIVOS ---
-    # Nota: Quitamos el check fijo de "3 archivos" porque ahora es dinámico según el plan
+    # 3. Procesar Archivos
     model_parts = []
     original_filenames = []
 
@@ -390,14 +375,20 @@ async def analyze_documents(
         file.file.seek(0, 2)
         file_size = file.file.tell()
         file.file.seek(0)
+        
+        # Validación extra de seguridad
         if file_size > (MAX_FILE_SIZE_MB * 1024 * 1024):
             raise HTTPException(400, f"El archivo {file.filename} excede el límite de {MAX_FILE_SIZE_MB}MB.")
+        
         content = await file.read()
         is_pdf = content.startswith(b'%PDF')
         is_docx = content.startswith(b'PK\x03\x04')
+        
         if not (is_pdf or is_docx):
              raise HTTPException(400, f"El archivo {file.filename} no es un PDF o DOCX válido.")
+             
         original_filenames.append(file.filename)
+        
         if is_pdf:
             model_parts.append(Part.from_data(data=content, mime_type="application/pdf"))
         else:
@@ -407,6 +398,7 @@ async def analyze_documents(
     model_parts.append(f"\nINSTRUCCIONES: {instructions}")
     model = GenerativeModel(model_name=GEMINI_MODEL_NAME, system_instruction=ANALYZER_SYSTEM_PROMPT)
     
+    # Configuración Generativa
     safety_settings = [
         SafetySetting(category=HarmCategory.HARM_CATEGORY_HATE_SPEECH, threshold=HarmBlockThreshold.BLOCK_NONE),
         SafetySetting(category=HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT, threshold=HarmBlockThreshold.BLOCK_NONE),
@@ -431,22 +423,29 @@ async def analyze_documents(
                     full_text += chunk.text
                     yield f"data: {json.dumps({'text': chunk.text})}\n\n"
             
+            # Guardar historial si tuvo éxito
             user_id = current_user.get("uid")
             title = (instructions[:40] + '...') if len(instructions) > 40 else instructions
             doc_ref = db.collection("analysis_history").document()
             await doc_ref.set({
-                "userId": user_id, "title": title, "instructions": instructions,
-                "analysis": full_text, "timestamp": SERVER_TIMESTAMP, "original_filenames": original_filenames
+                "userId": user_id, 
+                "title": title, 
+                "instructions": instructions,
+                "analysis": full_text, 
+                "timestamp": SERVER_TIMESTAMP, 
+                "original_filenames": original_filenames
             })
             yield f"data: {json.dumps({'done': True, 'analysis_id': doc_ref.id})}\n\n"
+            
         except Exception as e:
             print(f"Error stream: {e}")
             yield f"data: {json.dumps({'error': str(e)})}\n\n"
 
+    # Envolvemos para contar uso solo si se inició el stream
     async def counted_stream():
         async for chunk in generate_stream():
             yield chunk
-        # Si todo salió bien, incrementamos el contador
+        # Incremento final
         await increment_analysis_count(user_id)
 
     return StreamingResponse(counted_stream(), media_type="text/event-stream")
@@ -458,7 +457,12 @@ async def download_analysis(
     file_format: str = Form("docx"),
     current_user: Dict[str, Any] = Depends(get_current_user)
 ):
-    await verify_active_subscription(current_user) # <--- VALIDACIÓN ACTIVA
+    # Verificación de acceso básica (Basta con tener plan)
+    user_id = current_user['uid']
+    user_email = current_user.get('email', '')
+    plan = await get_user_plan_unified(user_email, user_id)
+    if plan == 'none': raise HTTPException(403, "Sin acceso")
+
     try:
         if file_format.lower() == "docx":
             content, mime, fname = await asyncio.to_thread(create_docx_sync, analysis_text, instructions)
@@ -470,8 +474,15 @@ async def download_analysis(
 
 @app.get("/analysis-history/")
 async def get_analysis_history(current_user: Dict[str, Any] = Depends(get_current_user)):
-    await verify_active_subscription(current_user) # <--- VALIDACIÓN ACTIVA
-    user_id = current_user.get("uid")
+    user_id = current_user['uid']
+    user_email = current_user.get('email', '')
+    
+    # VALIDACIÓN CORREGIDA: Usa la lógica unificada
+    plan = await get_user_plan_unified(user_email, user_id)
+    if plan == 'none': 
+        # Si no tiene plan, devolvemos error 403
+        raise HTTPException(403, "Requiere plan activo para ver historial")
+
     ref = db.collection("analysis_history").where("userId", "==", user_id).order_by("timestamp", direction=Query.DESCENDING)
     history = []
     async for d in ref.stream():
@@ -480,23 +491,30 @@ async def get_analysis_history(current_user: Dict[str, Any] = Depends(get_curren
 
 @app.get("/analysis-history/{analysis_id}")
 async def get_analysis_detail(analysis_id: str, current_user: Dict[str, Any] = Depends(get_current_user)):
-    await verify_active_subscription(current_user) # <--- VALIDACIÓN ACTIVA
+    user_id = current_user['uid']
+    user_email = current_user.get('email', '')
+    
+    plan = await get_user_plan_unified(user_email, user_id)
+    if plan == 'none': raise HTTPException(403, "Requiere plan activo")
+
     doc = await db.collection("analysis_history").document(analysis_id).get()
     if not doc.exists: raise HTTPException(404)
     data = doc.to_dict()
-    if data.get("userId") != current_user.get("uid"): raise HTTPException(403)
+    if data.get("userId") != user_id: raise HTTPException(403)
     return data
 
 @app.delete("/analysis-history/{analysis_id}")
 async def delete_analysis(analysis_id: str, current_user: Dict[str, Any] = Depends(get_current_user)):
-    await verify_active_subscription(current_user) # <--- VALIDACIÓN ACTIVA
-    ref = db.collection("analysis_history").document(analysis_id)
-    doc = await ref.get()
+    user_id = current_user['uid']
+    doc_ref = db.collection("analysis_history").document(analysis_id)
+    doc = await doc_ref.get()
+    
     if not doc.exists: raise HTTPException(404)
-    if doc.to_dict().get("userId") != current_user.get("uid"): raise HTTPException(403)
-    await ref.delete()
+    if doc.to_dict().get("userId") != user_id: raise HTTPException(403)
+    
+    await doc_ref.delete()
     return {"status": "ok"}
 
 @app.get("/")
 def read_root():
-    return {"status": "ok", "msg": "API Analizador Activa v3.0 (Stripe Enabled)"}
+    return {"status": "ok", "msg": "API Analizador v2.1 (Unified Plan Logic)"}
