@@ -12,8 +12,9 @@ from typing import List, Dict, Any
 from dotenv import load_dotenv
 from docx import Document
 from fpdf import FPDF
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from google.cloud.firestore import AsyncClient, SERVER_TIMESTAMP, Query
+from google.cloud import firestore
 import google.auth
 import vertexai
 from vertexai.generative_models import (
@@ -50,6 +51,74 @@ if PROJECT_ID:
 db = AsyncClient(project=PROJECT_ID)
 
 app = FastAPI(title="PIDA Document Analyzer (Streaming)")
+
+# --- VARIABLES DE LÍMITES (Desde Cloud Run) ---
+LIMIT_BASICO_ANALYSIS_DAILY = int(os.getenv("LIMIT_BASICO_ANALYSIS_DAILY", 3))
+LIMIT_AVANZADO_ANALYSIS_DAILY = int(os.getenv("LIMIT_AVANZADO_ANALYSIS_DAILY", 15))
+LIMIT_PREMIUM_ANALYSIS_DAILY = int(os.getenv("LIMIT_PREMIUM_ANALYSIS_DAILY", 25))
+
+LIMIT_BASICO_DOCS = int(os.getenv("LIMIT_BASICO_DOCS", 1))
+LIMIT_AVANZADO_DOCS = int(os.getenv("LIMIT_AVANZADO_DOCS", 3))
+LIMIT_PREMIUM_DOCS = int(os.getenv("LIMIT_PREMIUM_DOCS", 5))
+
+# --- MAPAS DE LÍMITES ---
+ANALYSIS_LIMITS = {
+    "basico": LIMIT_BASICO_ANALYSIS_DAILY,
+    "avanzado": LIMIT_AVANZADO_ANALYSIS_DAILY,
+    "premium": LIMIT_PREMIUM_ANALYSIS_DAILY,
+    "vip": -1  # Ilimitado
+}
+
+DOCS_LIMITS = {
+    "basico": LIMIT_BASICO_DOCS,
+    "avanzado": LIMIT_AVANZADO_DOCS,
+    "premium": LIMIT_PREMIUM_DOCS,
+    "vip": 100 
+}
+
+def get_date_utc_minus_6() -> str:
+    utc_now = datetime.now(timezone.utc)
+    cst_now = utc_now - timedelta(hours=6)
+    return cst_now.strftime('%Y-%m-%d')
+
+async def check_analysis_limits(user_id: str, plan: str, num_files: int):
+    plan_key = plan.lower().strip()
+    
+    # 1. VERIFICAR CANTIDAD DE ARCHIVOS
+    max_docs = DOCS_LIMITS.get(plan_key, 0)
+    
+    if max_docs != -1 and num_files > max_docs:
+        raise HTTPException(
+            status_code=403,
+            detail=f"Tu plan {plan_key.capitalize()} solo permite analizar {max_docs} documento(s) a la vez. Has subido {num_files}."
+        )
+
+    # 2. VERIFICAR USO DIARIO
+    limit_daily = ANALYSIS_LIMITS.get(plan_key, 0)
+    
+    if limit_daily == -1: return
+
+    today = get_date_utc_minus_6()
+    stats_ref = db.collection('users').document(user_id).collection('usage_stats').document(today)
+    doc = await stats_ref.get()
+    
+    current_count = 0
+    if doc.exists:
+        current_count = doc.to_dict().get('analysis_count', 0)
+        
+    if current_count >= limit_daily:
+        raise HTTPException(
+            status_code=429,
+            detail=f"Límite diario alcanzado para el plan {plan_key}"
+        )
+
+async def increment_analysis_count(user_id: str):
+    today = get_date_utc_minus_6()
+    stats_ref = db.collection('users').document(user_id).collection('usage_stats').document(today)
+    await stats_ref.set({
+        'analysis_count': firestore.Increment(1),
+        'last_updated': SERVER_TIMESTAMP
+    }, merge=True)
 
 # --- CONFIGURACIÓN DE SEGURIDAD (NUEVO) ---
 try:
@@ -278,8 +347,42 @@ async def analyze_documents(
     instructions: str = Form(...),
     current_user: Dict[str, Any] = Depends(get_current_user)
 ):
-    await verify_active_subscription(current_user) # <--- VALIDACIÓN ACTIVA
-    if len(files) > 3: raise HTTPException(400, "Máximo 3 archivos.")
+    # 1. OBTENER PLAN USUARIO Y DETECTAR VIP (Variables de Entorno)
+    user_id = current_user['uid']
+    user_email = current_user.get('email', '').strip().lower()
+    user_plan = 'none'
+
+    # A. Chequeo VIP (Usando las mismas variables de entorno que verify_active_subscription)
+    try:
+        raw_domains = os.getenv("ADMIN_DOMAINS", '[]')
+        raw_emails = os.getenv("ADMIN_EMAILS", '[]')
+        admin_domains = [str(d).strip().lower() for d in json.loads(raw_domains)]
+        admin_emails = [str(e).strip().lower() for e in json.loads(raw_emails)]
+    except:
+        admin_domains, admin_emails = [], []
+
+    email_domain = user_email.split("@")[-1] if "@" in user_email else ""
+
+    if (email_domain in admin_domains) or (user_email in admin_emails):
+        user_plan = 'vip'
+    else:
+        # B. Chequeo Firestore (Plan Pagado)
+        try:
+            cust_doc = await db.collection('customers').document(user_id).get()
+            if cust_doc.exists:
+                data = cust_doc.to_dict()
+                if data.get('status') == 'active':
+                    user_plan = data.get('plan', 'basico')
+                    # Trial se mapea a básico para límites
+                    if data.get('has_trial'): user_plan = 'basico'
+        except Exception as e:
+            print(f"Error obteniendo plan: {e}")
+
+    # 2. VERIFICAR LÍMITES (Esto lanzará 403 o 429 si falla)
+    await check_analysis_limits(user_id, user_plan, len(files))
+
+    # --- LÓGICA DE ARCHIVOS ---
+    # Nota: Quitamos el check fijo de "3 archivos" porque ahora es dinámico según el plan
     model_parts = []
     original_filenames = []
 
@@ -340,7 +443,13 @@ async def analyze_documents(
             print(f"Error stream: {e}")
             yield f"data: {json.dumps({'error': str(e)})}\n\n"
 
-    return StreamingResponse(generate_stream(), media_type="text/event-stream")
+    async def counted_stream():
+        async for chunk in generate_stream():
+            yield chunk
+        # Si todo salió bien, incrementamos el contador
+        await increment_analysis_count(user_id)
+
+    return StreamingResponse(counted_stream(), media_type="text/event-stream")
 
 @app.post("/download-analysis")
 async def download_analysis(
