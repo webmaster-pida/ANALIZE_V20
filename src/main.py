@@ -435,20 +435,17 @@ async def analyze_documents(
                 "timestamp": SERVER_TIMESTAMP, 
                 "original_filenames": original_filenames
             })
+            
+            # CORRECCIÓN: Incrementamos SOLO si llegamos al final con éxito
+            await increment_analysis_count(user_id)
+            
             yield f"data: {json.dumps({'done': True, 'analysis_id': doc_ref.id})}\n\n"
             
         except Exception as e:
             print(f"Error stream: {e}")
             yield f"data: {json.dumps({'error': str(e)})}\n\n"
 
-    # Envolvemos para contar uso solo si se inició el stream
-    async def counted_stream():
-        async for chunk in generate_stream():
-            yield chunk
-        # Incremento final
-        await increment_analysis_count(user_id)
-
-    return StreamingResponse(counted_stream(), media_type="text/event-stream")
+    return StreamingResponse(generate_stream(), media_type="text/event-stream")
 
 @app.post("/download-analysis")
 async def download_analysis(
