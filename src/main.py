@@ -348,7 +348,7 @@ async def analyze_documents(
     gen_config = {
         "temperature": float(os.getenv("GEMINI_TEMP", "0.4")),
         "top_p": float(os.getenv("GEMINI_TOP_P", "0.95")),
-        "max_output_tokens": 16348
+        "max_output_tokens": 32696
     }
 
     async def generate_stream():
