@@ -50,6 +50,16 @@ if PROJECT_ID:
 # Inicializar Firestore
 db = AsyncClient(project=PROJECT_ID)
 
+# --- LÍMITES CONFIGURABLES (IGUAL QUE EN CHATv20) ---
+DAILY_LIMIT_BASICO = int(os.getenv("DAILY_LIMIT_BASICO", "3"))
+DOCS_LIMIT_BASICO = int(os.getenv("DOCS_LIMIT_BASICO", "1"))
+
+DAILY_LIMIT_AVANZADO = int(os.getenv("DAILY_LIMIT_AVANZADO", "15"))
+DOCS_LIMIT_AVANZADO = int(os.getenv("DOCS_LIMIT_AVANZADO", "3"))
+
+DAILY_LIMIT_PREMIUM = int(os.getenv("DAILY_LIMIT_PREMIUM", "25"))
+DOCS_LIMIT_PREMIUM = int(os.getenv("DOCS_LIMIT_PREMIUM", "5"))
+
 app = FastAPI(title="PIDA Document Analyzer (Streaming)")
 
 # --- VARIABLES DE LÍMITES (Desde Cloud Run) ---
@@ -409,7 +419,7 @@ async def analyze_documents(
     gen_config = {
         "temperature": float(os.getenv("GEMINI_TEMP", "0.4")),
         "top_p": float(os.getenv("GEMINI_TOP_P", "0.95")),
-        "max_output_tokens": 16348
+        "max_output_tokens": 32696
     }
 
     async def generate_stream():
