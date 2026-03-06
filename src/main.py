@@ -118,12 +118,14 @@ def get_date_utc_minus_6() -> str:
     cst_now = utc_now - timedelta(hours=6)
     return cst_now.strftime('%Y-%m-%d')
 
-async def get_user_plan_unified(user_email: str, user_id: str) -> str:
+async def get_user_plan_unified(current_user: Dict[str, Any]) -> str:
     """
     Determina el plan del usuario unificando lógica VIP y DB.
     Retorna: 'vip', 'basico', 'avanzado', 'premium' o 'none'.
     """
-    user_email = user_email.strip().lower()
+    user_id = current_user.get('uid')
+    user_email = current_user.get('email', '').strip().lower()
+    email_verified = current_user.get('email_verified', False)
     
     # 1. VERIFICACIÓN VIP (Variables de Entorno)
     try:
@@ -135,7 +137,9 @@ async def get_user_plan_unified(user_email: str, user_id: str) -> str:
         admin_domains, admin_emails = [], []
 
     email_domain = user_email.split("@")[-1] if "@" in user_email else ""
-    if (email_domain in admin_domains) or (user_email in admin_emails):
+    
+    # 🛡️ PROTECCIÓN: Exigir email_verified
+    if email_verified and ((email_domain in admin_domains) or (user_email in admin_emails)):
         return 'vip'
 
     # 2. VERIFICACIÓN FIRESTORE (Documento de Cliente)
@@ -370,9 +374,8 @@ async def analyze_documents(
 ):
     # 1. Obtener Plan del Usuario
     user_id = current_user['uid']
-    user_email = current_user.get('email', '')
     
-    plan = await get_user_plan_unified(user_email, user_id)
+    plan = await get_user_plan_unified(current_user)
     
     # 2. Verificar Acceso y Límites
     await check_analysis_access_and_limits(user_id, plan, len(files), check_daily=True)
@@ -465,9 +468,7 @@ async def download_analysis(
     current_user: Dict[str, Any] = Depends(get_current_user)
 ):
     # Verificación de acceso básica (Basta con tener plan)
-    user_id = current_user['uid']
-    user_email = current_user.get('email', '')
-    plan = await get_user_plan_unified(user_email, user_id)
+    plan = await get_user_plan_unified(current_user)
     if plan == 'none': raise HTTPException(403, "Sin acceso")
 
     try:
@@ -482,10 +483,9 @@ async def download_analysis(
 @app.get("/analysis-history/")
 async def get_analysis_history(current_user: Dict[str, Any] = Depends(get_current_user)):
     user_id = current_user['uid']
-    user_email = current_user.get('email', '')
     
     # VALIDACIÓN CORREGIDA: Usa la lógica unificada
-    plan = await get_user_plan_unified(user_email, user_id)
+    plan = await get_user_plan_unified(current_user)
     if plan == 'none': 
         # Si no tiene plan, devolvemos error 403
         raise HTTPException(403, "Requiere plan activo para ver historial")
@@ -499,9 +499,8 @@ async def get_analysis_history(current_user: Dict[str, Any] = Depends(get_curren
 @app.get("/analysis-history/{analysis_id}")
 async def get_analysis_detail(analysis_id: str, current_user: Dict[str, Any] = Depends(get_current_user)):
     user_id = current_user['uid']
-    user_email = current_user.get('email', '')
     
-    plan = await get_user_plan_unified(user_email, user_id)
+    plan = await get_user_plan_unified(current_user)
     if plan == 'none': raise HTTPException(403, "Requiere plan activo")
 
     doc = await db.collection("analysis_history").document(analysis_id).get()
