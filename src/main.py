@@ -148,64 +148,60 @@ async def get_user_plan_unified(current_user: Dict[str, Any]) -> str:
         if cust_doc.exists:
             data = cust_doc.to_dict()
             status = data.get('status')
-            # Aceptamos active o trialing
             if status in ['active', 'trialing']:
                 plan = data.get('plan', 'basico')
-                # Normalizamos nombres de plan
                 return plan.lower() if plan else 'basico'
     except Exception as e:
         print(f"Error consultando plan en DB: {e}")
         
     return 'none' # Sin acceso
 
-async def check_analysis_access_and_limits(user_id: str, plan_key: str, num_files: int = 0, check_daily: bool = True):
-    """
-    Verifica si el plan permite operar y si cumple los límites.
-    Lanza HTTPException si falla.
-    """
-    if plan_key == 'none':
-        raise HTTPException(status_code=403, detail="No tienes un plan activo para realizar análisis.")
+# 🛡️ NUEVAS FUNCIONES DE CONSUMO ATÓMICO Y REEMBOLSO (Mitigación DoS y ByPass)
+async def consume_analysis_credit(user_id: str, plan_key: str):
+    limit_daily = ANALYSIS_LIMITS.get(plan_key, 0)
+    if limit_daily == -1: return # VIP Ilimitado
 
-    # 1. VERIFICAR CANTIDAD DE ARCHIVOS
-    if num_files > 0:
-        max_docs = DOCS_LIMITS.get(plan_key, 0)
-        if max_docs != -1 and num_files > max_docs:
-            raise HTTPException(
-                status_code=403,
-                detail=f"Tu plan {plan_key.capitalize()} solo permite analizar {max_docs} documento(s) a la vez."
-            )
-
-    # 2. VERIFICAR USO DIARIO
-    if check_daily:
-        limit_daily = ANALYSIS_LIMITS.get(plan_key, 0)
-        if limit_daily == -1: return # VIP Ilimitado
-
-        today = get_date_utc_minus_6()
-        stats_ref = db.collection('users').document(user_id).collection('usage_stats').document(today)
-        doc = await stats_ref.get()
-        
-        current_count = 0
-        if doc.exists:
-            current_count = doc.to_dict().get('analysis_count', 0)
-            
-        if current_count >= limit_daily:
-            raise HTTPException(
-                status_code=429,
-                detail=f"Límite diario alcanzado para el plan {plan_key}"
-            )
-
-async def increment_analysis_count(user_id: str):
-    """Incrementa el contador de uso"""
     today = get_date_utc_minus_6()
     stats_ref = db.collection('users').document(user_id).collection('usage_stats').document(today)
-    await stats_ref.set({
-        'analysis_count': firestore.Increment(1),
-        'last_updated': SERVER_TIMESTAMP
-    }, merge=True)
+    
+    @firestore.async_transactional
+    async def check_and_increment(transaction, ref):
+        snapshot = await ref.get(transaction=transaction)
+        current_count = snapshot.get('analysis_count') if snapshot.exists else 0
+        
+        if current_count >= limit_daily:
+            raise HTTPException(status_code=429, detail=f"Límite diario alcanzado para el plan {plan_key}")
+        
+        transaction.set(ref, {
+            'analysis_count': current_count + 1,
+            'last_updated': firestore.SERVER_TIMESTAMP
+        }, merge=True)
+
+    transaction = db.transaction()
+    await check_and_increment(transaction, stats_ref)
+
+async def refund_analysis_credit(user_id: str):
+    today = get_date_utc_minus_6()
+    stats_ref = db.collection('users').document(user_id).collection('usage_stats').document(today)
+    
+    @firestore.async_transactional
+    async def check_and_decrement(transaction, ref):
+        snapshot = await ref.get(transaction=transaction)
+        if snapshot.exists:
+            current_count = snapshot.get('analysis_count', 0)
+            if current_count > 0:
+                transaction.update(ref, {
+                    'analysis_count': current_count - 1,
+                    'last_updated': firestore.SERVER_TIMESTAMP
+                })
+    try:
+        transaction = db.transaction()
+        await check_and_decrement(transaction, stats_ref)
+    except Exception as e:
+        print(f"Error en reembolso de análisis: {e}")
 
 # --- UTILIDADES DE NOMBRE DE ARCHIVO ---
 def generate_filename(instructions: str, extension: str) -> str:
-    """Genera un nombre de archivo basado en el título y fecha exacta."""
     safe_title = re.sub(r'[^a-zA-Z0-9áéíóúÁÉÍÓÚñÑ ]', '', instructions[:40])
     safe_title = safe_title.strip().replace(' ', '_')
     if not safe_title:
@@ -215,7 +211,6 @@ def generate_filename(instructions: str, extension: str) -> str:
 
 # --- UTILIDADES DE LIMPIEZA TEXTO ---
 def sanitize_text_for_pdf(text: str) -> str:
-    """Limpia caracteres incompatibles con Latin-1."""
     if not text: return ""
     replacements = {
         "•": "-", "—": "-", "–": "-", "“": '"', "”": '"', "‘": "'", "’": "'", "…": "...",
@@ -227,10 +222,6 @@ def sanitize_text_for_pdf(text: str) -> str:
 
 # --- PARSER DE MARKDOWN PARA PDF ---
 def write_markdown_to_pdf(pdf, text):
-    """
-    Escribe texto en el PDF interpretando Markdown básico (## Títulos y **Negritas**)
-    para que no salgan los asteriscos.
-    """
     pdf.set_font("Arial", "", 11)
     
     for line in text.split('\n'):
@@ -365,6 +356,37 @@ def create_pdf_sync(analysis_text: str, instructions: str) -> tuple[bytes, str, 
         err.multi_cell(0, 10, f"Error: {str(e)}")
         return err.output(dest='S').encode('latin-1'), "application/pdf", "Error.pdf"
 
+
+async def stream_analysis_generator(model, model_parts, gen_config, safety_settings, current_user, instructions, original_filenames):
+    full_text = ""
+    try:
+        responses = await model.generate_content_async(
+            model_parts, generation_config=gen_config, safety_settings=safety_settings, stream=True
+        )
+        async for chunk in responses:
+            if chunk.text:
+                full_text += chunk.text
+                yield f"data: {json.dumps({'text': chunk.text})}\n\n"
+        
+        # Guardar historial si tuvo éxito
+        user_id = current_user.get("uid")
+        title = (instructions[:40] + '...') if len(instructions) > 40 else instructions
+        doc_ref = db.collection("analysis_history").document()
+        await doc_ref.set({
+            "userId": user_id, 
+            "title": title, 
+            "instructions": instructions,
+            "analysis": full_text, 
+            "timestamp": SERVER_TIMESTAMP, 
+            "original_filenames": original_filenames
+        })
+        
+        yield f"data: {json.dumps({'done': True, 'analysis_id': doc_ref.id})}\n\n"
+        
+    except Exception as e:
+        print(f"Error stream: {e}")
+        yield f"data: {json.dumps({'error': str(e)})}\n\n"
+
 # --- ENDPOINTS ---
 @app.post("/analyze/")
 async def analyze_documents(
@@ -372,13 +394,20 @@ async def analyze_documents(
     instructions: str = Form(...),
     current_user: Dict[str, Any] = Depends(get_current_user)
 ):
-    # 1. Obtener Plan del Usuario
     user_id = current_user['uid']
-    
     plan = await get_user_plan_unified(current_user)
     
-    # 2. Verificar Acceso y Límites
-    await check_analysis_access_and_limits(user_id, plan, len(files), check_daily=True)
+    if plan == 'none':
+        raise HTTPException(status_code=403, detail="No tienes un plan activo para realizar análisis.")
+
+    # Verificación de cantidad de archivos
+    num_files = len(files)
+    max_docs = DOCS_LIMITS.get(plan, 0)
+    if max_docs != -1 and num_files > max_docs:
+        raise HTTPException(status_code=403, detail=f"Tu plan {plan.capitalize()} solo permite analizar {max_docs} documento(s) a la vez.")
+
+    # 🛡️ CONSUMO ATÓMICO PREVIO (Previene bypass de concurrencia)
+    await consume_analysis_credit(user_id, plan)
 
     # 3. Procesar Archivos
     model_parts = []
@@ -389,8 +418,8 @@ async def analyze_documents(
         file_size = file.file.tell()
         file.file.seek(0)
         
-        # Validación extra de seguridad
         if file_size > (MAX_FILE_SIZE_MB * 1024 * 1024):
+            asyncio.create_task(refund_analysis_credit(user_id)) # Reembolsar si el archivo es grande
             raise HTTPException(400, f"El archivo {file.filename} excede el límite de {MAX_FILE_SIZE_MB}MB.")
         
         content = await file.read()
@@ -398,6 +427,7 @@ async def analyze_documents(
         is_docx = content.startswith(b'PK\x03\x04')
         
         if not (is_pdf or is_docx):
+             asyncio.create_task(refund_analysis_credit(user_id)) # Reembolsar si archivo inválido
              raise HTTPException(400, f"El archivo {file.filename} no es un PDF o DOCX válido.")
              
         original_filenames.append(file.filename)
@@ -411,7 +441,6 @@ async def analyze_documents(
     model_parts.append(f"\nINSTRUCCIONES: {instructions}")
     model = GenerativeModel(model_name=GEMINI_MODEL_NAME, system_instruction=ANALYZER_SYSTEM_PROMPT)
     
-    # Configuración Generativa
     safety_settings = [
         SafetySetting(category=HarmCategory.HARM_CATEGORY_HATE_SPEECH, threshold=HarmBlockThreshold.BLOCK_NONE),
         SafetySetting(category=HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT, threshold=HarmBlockThreshold.BLOCK_NONE),
@@ -425,40 +454,24 @@ async def analyze_documents(
         "max_output_tokens": 32696
     }
 
-    async def generate_stream():
-        full_text = ""
+    # 🛡️ GENERADOR CONSTRUIDO CON PROTECCIÓN DE REEMBOLSO
+    async def counted_stream_generator():
+        has_error = False
+        tokens_sent = False
         try:
-            responses = await model.generate_content_async(
-                model_parts, generation_config=gen_config, safety_settings=safety_settings, stream=True
-            )
-            async for chunk in responses:
-                if chunk.text:
-                    full_text += chunk.text
-                    yield f"data: {json.dumps({'text': chunk.text})}\n\n"
-            
-            # Guardar historial si tuvo éxito
-            user_id = current_user.get("uid")
-            title = (instructions[:40] + '...') if len(instructions) > 40 else instructions
-            doc_ref = db.collection("analysis_history").document()
-            await doc_ref.set({
-                "userId": user_id, 
-                "title": title, 
-                "instructions": instructions,
-                "analysis": full_text, 
-                "timestamp": SERVER_TIMESTAMP, 
-                "original_filenames": original_filenames
-            })
-            
-            # CORRECCIÓN: Incrementamos SOLO si llegamos al final con éxito
-            await increment_analysis_count(user_id)
-            
-            yield f"data: {json.dumps({'done': True, 'analysis_id': doc_ref.id})}\n\n"
-            
-        except Exception as e:
-            print(f"Error stream: {e}")
-            yield f"data: {json.dumps({'error': str(e)})}\n\n"
+            async for chunk in stream_analysis_generator(
+                model, model_parts, gen_config, safety_settings, current_user, instructions, original_filenames
+            ):
+                if '"error":' in chunk:
+                    has_error = True
+                if '"text":' in chunk and not has_error:
+                    tokens_sent = True
+                yield chunk
+        finally:
+            if has_error or not tokens_sent:
+                asyncio.create_task(refund_analysis_credit(user_id))
 
-    return StreamingResponse(generate_stream(), media_type="text/event-stream")
+    return StreamingResponse(counted_stream_generator(), media_type="text/event-stream")
 
 @app.post("/download-analysis")
 async def download_analysis(
@@ -467,9 +480,14 @@ async def download_analysis(
     file_format: str = Form("docx"),
     current_user: Dict[str, Any] = Depends(get_current_user)
 ):
-    # Verificación de acceso básica (Basta con tener plan)
     plan = await get_user_plan_unified(current_user)
     if plan == 'none': raise HTTPException(403, "Sin acceso")
+
+    # 🛡️ PROTECCIÓN CONTRA INYECCIÓN DE TEXTO / DoS
+    if len(analysis_text) > 50000:
+        analysis_text = analysis_text[:50000] + "\n\n[Texto truncado por límite de seguridad]"
+    if len(instructions) > 5000:
+        instructions = instructions[:5000] + "..."
 
     try:
         if file_format.lower() == "docx":
@@ -484,11 +502,8 @@ async def download_analysis(
 async def get_analysis_history(current_user: Dict[str, Any] = Depends(get_current_user)):
     user_id = current_user['uid']
     
-    # VALIDACIÓN CORREGIDA: Usa la lógica unificada
     plan = await get_user_plan_unified(current_user)
-    if plan == 'none': 
-        # Si no tiene plan, devolvemos error 403
-        raise HTTPException(403, "Requiere plan activo para ver historial")
+    if plan == 'none': raise HTTPException(403, "Requiere plan activo para ver historial")
 
     ref = db.collection("analysis_history").where("userId", "==", user_id).order_by("timestamp", direction=Query.DESCENDING)
     history = []
@@ -523,4 +538,4 @@ async def delete_analysis(analysis_id: str, current_user: Dict[str, Any] = Depen
 
 @app.get("/")
 def read_root():
-    return {"status": "ok", "msg": "API Analizador v2.1 (Unified Plan Logic)"}
+    return {"status": "ok", "msg": "API Analizador v2.1 (Unified Plan Logic & Security Patched)"}
