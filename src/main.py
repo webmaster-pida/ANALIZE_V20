@@ -357,7 +357,7 @@ def create_pdf_sync(analysis_text: str, instructions: str) -> tuple[bytes, str, 
         return err.output(dest='S').encode('latin-1'), "application/pdf", "Error.pdf"
 
 
-async def stream_analysis_generator(model, model_parts, gen_config, safety_settings, current_user, instructions, original_filenames):
+async def stream_analysis_generator(model, model_parts, gen_config, safety_settings, current_user, instructions, original_filenames, analysis_id, history_json):
     full_text = ""
     try:
         responses = await model.generate_content_async(
@@ -368,20 +368,50 @@ async def stream_analysis_generator(model, model_parts, gen_config, safety_setti
                 full_text += chunk.text
                 yield f"data: {json.dumps({'text': chunk.text})}\n\n"
         
-        # Guardar historial si tuvo éxito
         user_id = current_user.get("uid")
-        title = (instructions[:40] + '...') if len(instructions) > 40 else instructions
-        doc_ref = db.collection("analysis_history").document()
-        await doc_ref.set({
-            "userId": user_id, 
-            "title": title, 
-            "instructions": instructions,
-            "analysis": full_text, 
-            "timestamp": SERVER_TIMESTAMP, 
-            "original_filenames": original_filenames
-        })
         
-        yield f"data: {json.dumps({'done': True, 'analysis_id': doc_ref.id})}\n\n"
+        # PROCESO DE HILO CONTINUO (THREADING)
+        final_history = []
+        if history_json:
+            try:
+                final_history = json.loads(history_json)
+            except:
+                pass
+        
+        final_history.append({"role": "model", "content": full_text})
+        final_id = analysis_id
+        
+        # 1. Si existe un ID previo, actualizamos el documento concatenando el historial
+        if final_id:
+            doc_ref = db.collection("analysis_history").document(final_id)
+            doc = await doc_ref.get()
+            if doc.exists:
+                await doc_ref.update({
+                    "analysis": json.dumps(final_history),
+                    "timestamp": SERVER_TIMESTAMP
+                })
+            else:
+                final_id = "" # Si el doc fue borrado, creamos uno nuevo
+                
+        # 2. Si es un análisis nuevo, lo creamos
+        if not final_id:
+            title_source = instructions
+            if final_history and len(final_history) > 0 and final_history[0].get("role") == "user":
+                title_source = final_history[0].get("content", instructions)
+            
+            title = (title_source[:40] + '...') if len(title_source) > 40 else title_source
+            doc_ref = db.collection("analysis_history").document()
+            await doc_ref.set({
+                "userId": user_id, 
+                "title": title, 
+                "instructions": title_source,
+                "analysis": json.dumps(final_history) if final_history else full_text, 
+                "timestamp": SERVER_TIMESTAMP, 
+                "original_filenames": original_filenames
+            })
+            final_id = doc_ref.id
+        
+        yield f"data: {json.dumps({'done': True, 'analysis_id': final_id})}\n\n"
         
     except Exception as e:
         print(f"Error stream: {e}")
@@ -392,6 +422,8 @@ async def stream_analysis_generator(model, model_parts, gen_config, safety_setti
 async def analyze_documents(
     files: List[UploadFile] = File(...),
     instructions: str = Form(...),
+    analysis_id: str = Form(""),
+    history_json: str = Form(""),
     current_user: Dict[str, Any] = Depends(get_current_user)
 ):
     user_id = current_user['uid']
@@ -438,7 +470,7 @@ async def analyze_documents(
             text = await asyncio.to_thread(read_docx_sync, content)
             model_parts.append(f"--- DOC: {file.filename} ---\n{text}\n------\n")
 
-    model_parts.append(f"\nINSTRUCCIONES: {instructions}")
+    model_parts.append(f"\nINSTRUCCIONES E HISTORIAL:\n{instructions}")
     model = GenerativeModel(model_name=GEMINI_MODEL_NAME, system_instruction=ANALYZER_SYSTEM_PROMPT)
     
     safety_settings = [
@@ -460,7 +492,7 @@ async def analyze_documents(
         tokens_sent = False
         try:
             async for chunk in stream_analysis_generator(
-                model, model_parts, gen_config, safety_settings, current_user, instructions, original_filenames
+                model, model_parts, gen_config, safety_settings, current_user, instructions, original_filenames, analysis_id, history_json
             ):
                 if '"error":' in chunk:
                     has_error = True
