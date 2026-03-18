@@ -6,6 +6,7 @@ fpdf
 markdown-it-py
 google-cloud-firestore
 google-cloud-aiplatform
+google-cloud-storage
 python-dotenv
 httpx
 firebase-admin

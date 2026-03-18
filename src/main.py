@@ -5,7 +5,7 @@ import json
 import io
 import re
 import asyncio
-from fastapi import FastAPI, File, Form, UploadFile, HTTPException, Response, Depends
+from fastapi import FastAPI, File, Form, UploadFile, HTTPException, Response, Depends, Body
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse 
 from typing import List, Dict, Any, Optional
@@ -15,6 +15,7 @@ from fpdf import FPDF
 from datetime import datetime, timedelta, timezone
 from google.cloud.firestore import AsyncClient, SERVER_TIMESTAMP, Query
 from google.cloud import firestore # Para tipos como Increment
+from google.cloud import storage # NUEVO IMPORT: Para generar URLs firmadas y leer PDFs
 import google.auth
 import vertexai
 from vertexai.generative_models import (
@@ -30,7 +31,7 @@ from src.core.prompts import ANALYZER_SYSTEM_PROMPT
 # Cargar variables
 load_dotenv()
 
-# --- CONFIGURACIÓN VERTEX AI ---
+# --- CONFIGURACIÓN VERTEX AI Y STORAGE ---
 try:
     _, project_id_default = google.auth.default()
     PROJECT_ID = os.getenv("PROJECT_ID", project_id_default)
@@ -38,14 +39,16 @@ except:
     PROJECT_ID = os.getenv("PROJECT_ID")
 
 LOCATION = os.getenv("GOOGLE_CLOUD_LOCATION", "us-central1")
-GEMINI_MODEL_NAME = os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip()
+GEMINI_MODEL_NAME = os.getenv("GEMINI_MODEL", "gemini-2.5-pro").strip()
+GCS_BUCKET_NAME = os.getenv("GCS_BUCKET_NAME", "pida-ai-temp-docs") # Nombre del bucket
 
 if PROJECT_ID:
     try:
         vertexai.init(project=PROJECT_ID, location=LOCATION)
-        print(f"Vertex AI inicializado: {PROJECT_ID}")
+        storage_client = storage.Client(project=PROJECT_ID) # Cliente de Storage
+        print(f"Vertex AI y Storage inicializados: {PROJECT_ID}")
     except Exception as e:
-        print(f"Error Vertex AI: {e}")
+        print(f"Error inicializando GCP: {e}")
 
 # Inicializar Firestore
 db = AsyncClient(project=PROJECT_ID)
@@ -60,7 +63,7 @@ DOCS_LIMIT_AVANZADO = int(os.getenv("DOCS_LIMIT_AVANZADO", "3"))
 DAILY_LIMIT_PREMIUM = int(os.getenv("DAILY_LIMIT_PREMIUM", "25"))
 DOCS_LIMIT_PREMIUM = int(os.getenv("DOCS_LIMIT_PREMIUM", "5"))
 
-app = FastAPI(title="PIDA Document Analyzer (Streaming)")
+app = FastAPI(title="PIDA Document Analyzer (Streaming & GCS)")
 
 # --- VARIABLES DE LÍMITES (Desde Cloud Run) ---
 # Valores por defecto de seguridad
@@ -311,6 +314,17 @@ def read_docx_sync(content: bytes) -> str:
         return "\n".join([p.text for p in doc.paragraphs])
     except: return ""
 
+# NUEVO: Función para descargar DOCX ligero temporalmente y extraer el texto
+def download_and_parse_docx(gs_uri: str) -> str:
+    try:
+        blob_path = "/".join(gs_uri.replace("gs://", "").split("/")[1:])
+        bucket = storage_client.bucket(GCS_BUCKET_NAME)
+        content = bucket.blob(blob_path).download_as_bytes()
+        return read_docx_sync(content)
+    except Exception as e:
+        print(f"Error procesando DOCX desde GCS: {e}")
+        return ""
+
 def create_docx_sync(analysis_text: str, instructions: str) -> tuple[bytes, str, str]:
     stream = io.BytesIO()
     doc = Document()
@@ -417,10 +431,57 @@ async def stream_analysis_generator(model, model_parts, gen_config, safety_setti
         print(f"Error stream: {e}")
         yield f"data: {json.dumps({'error': str(e)})}\n\n"
 
+
+# --- NUEVO ENDPOINT: GENERAR URLs FIRMADAS (Paso 1 del Frontend) ---
+@app.post("/generate-upload-urls/")
+async def generate_upload_urls(
+    payload: Dict[str, Any] = Body(...),
+    current_user: Dict[str, Any] = Depends(get_current_user)
+):
+    """
+    Retorna URLs firmadas para que el frontend suba directo a Cloud Storage.
+    """
+    user_id = current_user['uid']
+    plan = await get_user_plan_unified(current_user)
+    if plan == 'none': 
+        raise HTTPException(status_code=403, detail="Plan inactivo.")
+
+    files_req = payload.get("files", [])
+    max_docs = DOCS_LIMITS.get(plan, 0)
+    if max_docs != -1 and len(files_req) > max_docs:
+         raise HTTPException(status_code=403, detail=f"Tu plan permite subir {max_docs} documento(s) a la vez.")
+
+    urls_response = []
+    bucket = storage_client.bucket(GCS_BUCKET_NAME)
+
+    for f in files_req:
+        safe_name = re.sub(r'[^a-zA-Z0-9_.-]', '', f.get("name", "doc").replace(' ', '_'))
+        blob_path = f"uploads/{user_id}/{int(datetime.now().timestamp())}_{safe_name}"
+        blob = bucket.blob(blob_path)
+        
+        try:
+            signed_url = blob.generate_signed_url(
+                version="v4",
+                expiration=timedelta(minutes=15),
+                method="PUT",
+                content_type=f.get("type", "application/pdf")
+            )
+            urls_response.append({
+                "filename": f.get("name"),
+                "upload_url": signed_url,
+                "gs_uri": f"gs://{GCS_BUCKET_NAME}/{blob_path}",
+                "mime_type": f.get("type", "application/pdf")
+            })
+        except Exception as e:
+            raise HTTPException(500, f"Error generando URL segura. Verifica IAM: {e}")
+            
+    return {"urls": urls_response}
+
+
 # --- ENDPOINTS ---
 @app.post("/analyze/")
 async def analyze_documents(
-    files: List[UploadFile] = File(...),
+    files_data: str = Form(...), # NUEVO: Recibe JSON con URIs de Google Cloud Storage
     instructions: str = Form(...),
     analysis_id: str = Form(""),
     history_json: str = Form(""),
@@ -432,8 +493,13 @@ async def analyze_documents(
     if plan == 'none':
         raise HTTPException(status_code=403, detail="No tienes un plan activo para realizar análisis.")
 
+    try:
+        files_info = json.loads(files_data)
+    except:
+        raise HTTPException(400, "Formato de metadatos de archivos inválido.")
+
     # Verificación de cantidad de archivos
-    num_files = len(files)
+    num_files = len(files_info)
     max_docs = DOCS_LIMITS.get(plan, 0)
     if max_docs != -1 and num_files > max_docs:
         raise HTTPException(status_code=403, detail=f"Tu plan {plan.capitalize()} solo permite analizar {max_docs} documento(s) a la vez.")
@@ -441,34 +507,24 @@ async def analyze_documents(
     # 🛡️ CONSUMO ATÓMICO PREVIO (Previene bypass de concurrencia)
     await consume_analysis_credit(user_id, plan)
 
-    # 3. Procesar Archivos
+    # 3. Procesar Archivos desde GCS
     model_parts = []
     original_filenames = []
 
-    for file in files:
-        file.file.seek(0, 2)
-        file_size = file.file.tell()
-        file.file.seek(0)
+    for f_info in files_info:
+        gs_uri = f_info.get("gs_uri")
+        mime_type = f_info.get("mime_type", "application/pdf")
+        original_filename = f_info.get("filename", "documento")
         
-        if file_size > (MAX_FILE_SIZE_MB * 1024 * 1024):
-            asyncio.create_task(refund_analysis_credit(user_id)) # Reembolsar si el archivo es grande
-            raise HTTPException(400, f"El archivo {file.filename} excede el límite de {MAX_FILE_SIZE_MB}MB.")
+        original_filenames.append(original_filename)
         
-        content = await file.read()
-        is_pdf = content.startswith(b'%PDF')
-        is_docx = content.startswith(b'PK\x03\x04')
-        
-        if not (is_pdf or is_docx):
-             asyncio.create_task(refund_analysis_credit(user_id)) # Reembolsar si archivo inválido
-             raise HTTPException(400, f"El archivo {file.filename} no es un PDF o DOCX válido.")
-             
-        original_filenames.append(file.filename)
-        
-        if is_pdf:
-            model_parts.append(Part.from_data(data=content, mime_type="application/pdf"))
+        if mime_type == "application/pdf":
+            # GCS y Gemini leen el PDF de forma nativa e integrada
+            model_parts.append(Part.from_uri(uri=gs_uri, mime_type="application/pdf"))
         else:
-            text = await asyncio.to_thread(read_docx_sync, content)
-            model_parts.append(f"--- DOC: {file.filename} ---\n{text}\n------\n")
+            # Los DOCX son ligeros, los bajamos temporalmente a memoria
+            text = await asyncio.to_thread(download_and_parse_docx, gs_uri)
+            model_parts.append(f"--- DOC: {original_filename} ---\n{text}\n------\n")
 
     model_parts.append(f"\nINSTRUCCIONES E HISTORIAL:\n{instructions}")
     model = GenerativeModel(model_name=GEMINI_MODEL_NAME, system_instruction=ANALYZER_SYSTEM_PROMPT)
@@ -570,4 +626,4 @@ async def delete_analysis(analysis_id: str, current_user: Dict[str, Any] = Depen
 
 @app.get("/")
 def read_root():
-    return {"status": "ok", "msg": "API Analizador v2.1 (Unified Plan Logic & Security Patched)"}
+    return {"status": "ok", "msg": "API Analizador v2.1 (GCS Storage Integrado)"}
