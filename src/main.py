@@ -560,7 +560,7 @@ async def analyze_documents(
     gen_config = {
         "temperature": float(os.getenv("GEMINI_TEMP", "0.4")),
         "top_p": float(os.getenv("GEMINI_TOP_P", "0.95")),
-        "max_output_tokens": 32696
+        "max_output_tokens": 65535 # <--- AQUÍ ESTÁ EL CAMBIO DE TOKENS
     }
 
     # 🛡️ GENERADOR CONSTRUIDO CON PROTECCIÓN DE REEMBOLSO
@@ -593,8 +593,8 @@ async def download_analysis(
     if plan == 'none': raise HTTPException(403, "Sin acceso")
 
     # 🛡️ PROTECCIÓN CONTRA INYECCIÓN DE TEXTO / DoS
-    if len(analysis_text) > 50000:
-        analysis_text = analysis_text[:50000] + "\n\n[Texto truncado por límite de seguridad]"
+    if len(analysis_text) > 500000: # <--- AQUÍ ESTÁ EL CAMBIO DE LÍMITE DE DESCARGA
+        analysis_text = analysis_text[:500000] + "\n\n[Texto truncado por límite de seguridad]"
     if len(instructions) > 5000:
         instructions = instructions[:5000] + "..."
 
