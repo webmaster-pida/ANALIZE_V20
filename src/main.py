@@ -33,9 +33,28 @@ load_dotenv()
 
 # --- CONFIGURACIÓN VERTEX AI Y STORAGE ---
 try:
-    credentials, project_id_default = google.auth.default()
+    raw_credentials, project_id_default = google.auth.default()
     PROJECT_ID = os.getenv("PROJECT_ID", project_id_default)
-except:
+    
+    # 🛡️ FIX: Si estamos en Cloud Run, las credenciales por defecto no pueden firmar.
+    # Necesitamos "impersonar" la cuenta de servicio para que use la API de IAM internamente.
+    from google.auth.compute_engine.credentials import Credentials as ComputeEngineCredentials
+    from google.auth import impersonated_credentials
+    
+    if isinstance(raw_credentials, ComputeEngineCredentials):
+        print("Entorno Cloud Run detectado. Impersonando cuenta para firmar URLs...")
+        credentials = impersonated_credentials.Credentials(
+            source_credentials=raw_credentials,
+            target_principal="analize-v20@pida-ai-v20.iam.gserviceaccount.com",
+            target_scopes=["https://www.googleapis.com/auth/cloud-platform"],
+            lifetime=3600
+        )
+    else:
+        # Para desarrollo local si usas llaves JSON
+        credentials = raw_credentials
+
+except Exception as e:
+    print(f"Error configurando credenciales: {e}")
     PROJECT_ID = os.getenv("PROJECT_ID")
     credentials = None
 
@@ -46,7 +65,8 @@ GCS_BUCKET_NAME = os.getenv("GCS_BUCKET_NAME", "pida-ai-temp-docs") # Nombre del
 if PROJECT_ID:
     try:
         vertexai.init(project=PROJECT_ID, location=LOCATION)
-        storage_client = storage.Client(project=PROJECT_ID, credentials=credentials) # Cliente de Storage con credenciales
+        # Cliente de Storage con credenciales impersonadas
+        storage_client = storage.Client(project=PROJECT_ID, credentials=credentials) 
         print(f"Vertex AI y Storage inicializados: {PROJECT_ID}")
     except Exception as e:
         print(f"Error inicializando GCP: {e}")
@@ -465,8 +485,7 @@ async def generate_upload_urls(
                 version="v4",
                 expiration=timedelta(minutes=15),
                 method="PUT",
-                content_type=f.get("type", "application/pdf"),
-                service_account_email="analize-v20@pida-ai-v20.iam.gserviceaccount.com" # <--- AQUÍ ESTÁ EL CAMBIO
+                content_type=f.get("type", "application/pdf")
             )
             urls_response.append({
                 "filename": f.get("name"),
