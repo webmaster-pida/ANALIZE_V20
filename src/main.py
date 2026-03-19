@@ -33,10 +33,11 @@ load_dotenv()
 
 # --- CONFIGURACIÓN VERTEX AI Y STORAGE ---
 try:
-    _, project_id_default = google.auth.default()
+    credentials, project_id_default = google.auth.default()
     PROJECT_ID = os.getenv("PROJECT_ID", project_id_default)
 except:
     PROJECT_ID = os.getenv("PROJECT_ID")
+    credentials = None
 
 LOCATION = os.getenv("GOOGLE_CLOUD_LOCATION", "us-central1")
 GEMINI_MODEL_NAME = os.getenv("GEMINI_MODEL", "gemini-2.5-pro").strip()
@@ -45,7 +46,7 @@ GCS_BUCKET_NAME = os.getenv("GCS_BUCKET_NAME", "pida-ai-temp-docs") # Nombre del
 if PROJECT_ID:
     try:
         vertexai.init(project=PROJECT_ID, location=LOCATION)
-        storage_client = storage.Client(project=PROJECT_ID) # Cliente de Storage
+        storage_client = storage.Client(project=PROJECT_ID, credentials=credentials) # Cliente de Storage con credenciales
         print(f"Vertex AI y Storage inicializados: {PROJECT_ID}")
     except Exception as e:
         print(f"Error inicializando GCP: {e}")
@@ -464,7 +465,8 @@ async def generate_upload_urls(
                 version="v4",
                 expiration=timedelta(minutes=15),
                 method="PUT",
-                content_type=f.get("type", "application/pdf")
+                content_type=f.get("type", "application/pdf"),
+                service_account_email="analize-v20@pida-ai-v20.iam.gserviceaccount.com" # <--- AQUÍ ESTÁ EL CAMBIO
             )
             urls_response.append({
                 "filename": f.get("name"),
