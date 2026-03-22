@@ -5,6 +5,7 @@ import json
 import io
 import re
 import asyncio
+import fitz  # NUEVO: PyMuPDF para comprimir PDFs
 from fastapi import FastAPI, File, Form, UploadFile, HTTPException, Response, Depends, Body
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse 
@@ -15,7 +16,7 @@ from fpdf import FPDF
 from datetime import datetime, timedelta, timezone
 from google.cloud.firestore import AsyncClient, SERVER_TIMESTAMP, Query
 from google.cloud import firestore # Para tipos como Increment
-from google.cloud import storage # NUEVO IMPORT: Para generar URLs firmadas y leer PDFs
+from google.cloud import storage # Para generar URLs firmadas y leer PDFs
 import google.auth
 import vertexai
 from vertexai.generative_models import (
@@ -98,9 +99,9 @@ LIMIT_PREMIUM_DOCS = int(os.getenv("LIMIT_PREMIUM_DOCS", 5))
 
 # --- CONFIGURACIÓN DE SEGURIDAD DE ARCHIVOS ---
 try:
-    MAX_FILE_SIZE_MB = int(os.getenv("MAX_FILE_SIZE_MB", "10"))
+    MAX_FILE_SIZE_MB = int(os.getenv("MAX_FILE_SIZE_MB", "50"))
 except ValueError:
-    MAX_FILE_SIZE_MB = 10
+    MAX_FILE_SIZE_MB = 50
 
 # --- CORS ---
 raw_origins = os.getenv("ALLOWED_ORIGINS", '["https://pida-ai.com"]')
@@ -335,7 +336,6 @@ def read_docx_sync(content: bytes) -> str:
         return "\n".join([p.text for p in doc.paragraphs])
     except: return ""
 
-# NUEVO: Función para descargar DOCX ligero temporalmente y extraer el texto
 def download_and_parse_docx(gs_uri: str) -> str:
     try:
         blob_path = "/".join(gs_uri.replace("gs://", "").split("/")[1:])
@@ -405,7 +405,6 @@ async def stream_analysis_generator(model, model_parts, gen_config, safety_setti
         
         user_id = current_user.get("uid")
         
-        # PROCESO DE HILO CONTINUO (THREADING)
         final_history = []
         if history_json:
             try:
@@ -416,7 +415,6 @@ async def stream_analysis_generator(model, model_parts, gen_config, safety_setti
         final_history.append({"role": "model", "content": full_text})
         final_id = analysis_id
         
-        # 1. Si existe un ID previo, actualizamos el documento concatenando el historial
         if final_id:
             doc_ref = db.collection("analysis_history").document(final_id)
             doc = await doc_ref.get()
@@ -426,9 +424,8 @@ async def stream_analysis_generator(model, model_parts, gen_config, safety_setti
                     "timestamp": SERVER_TIMESTAMP
                 })
             else:
-                final_id = "" # Si el doc fue borrado, creamos uno nuevo
+                final_id = "" 
                 
-        # 2. Si es un análisis nuevo, lo creamos
         if not final_id:
             title_source = instructions
             if final_history and len(final_history) > 0 and final_history[0].get("role") == "user":
@@ -453,15 +450,64 @@ async def stream_analysis_generator(model, model_parts, gen_config, safety_setti
         yield f"data: {json.dumps({'error': str(e)})}\n\n"
 
 
-# --- NUEVO ENDPOINT: GENERAR URLs FIRMADAS (Paso 1 del Frontend) ---
+# =========================================================================
+# ENDPOINT DE COMPRESIÓN DE PDF (PyMuPDF) PARA DOCUMENTOS > 10MB
+# =========================================================================
+@app.post("/compress-and-upload/")
+async def compress_and_upload(
+    file: UploadFile = File(...),
+    current_user: Dict[str, Any] = Depends(get_current_user)
+):
+    """
+    Recibe un PDF pesado, lo comprime en memoria usando PyMuPDF
+    y lo sube a GCS, retornando la URL de Storage (gs_uri).
+    """
+    user_id = current_user['uid']
+    plan = await get_user_plan_unified(current_user)
+    if plan == 'none': 
+        raise HTTPException(status_code=403, detail="Plan inactivo.")
+
+    file_bytes = await file.read()
+    original_size = len(file_bytes) / (1024 * 1024)
+
+    try:
+        # Función síncrona para correr en un hilo y no bloquear el Event Loop de FastAPI
+        def compress_pdf(data: bytes) -> bytes:
+            if file.content_type != "application/pdf":
+                return data
+            
+            doc = fitz.open(stream=data, filetype="pdf")
+            # garbage=4: Elimina objetos muertos/duplicados. deflate=True: Comprime flujos/imágenes
+            return doc.tobytes(garbage=4, deflate=True)
+
+        compressed_bytes = await asyncio.to_thread(compress_pdf, file_bytes)
+        new_size = len(compressed_bytes) / (1024 * 1024)
+
+        bucket = storage_client.bucket(GCS_BUCKET_NAME)
+        safe_name = re.sub(r'[^a-zA-Z0-9_.-]', '', file.filename.replace(' ', '_'))
+        blob_path = f"uploads/{user_id}/{int(datetime.now().timestamp())}_opt_{safe_name}"
+        blob = bucket.blob(blob_path)
+        
+        await asyncio.to_thread(blob.upload_from_string, compressed_bytes, content_type=file.content_type)
+
+        return {
+            "filename": file.filename,
+            "gs_uri": f"gs://{GCS_BUCKET_NAME}/{blob_path}",
+            "mime_type": file.content_type,
+            "original_size_mb": original_size,
+            "new_size_mb": new_size
+        }
+        
+    except Exception as e:
+        print(f"Error comprimiendo el archivo {file.filename}: {e}")
+        raise HTTPException(status_code=500, detail=f"Error optimizando el documento: {str(e)}")
+
+
 @app.post("/generate-upload-urls/")
 async def generate_upload_urls(
     payload: Dict[str, Any] = Body(...),
     current_user: Dict[str, Any] = Depends(get_current_user)
 ):
-    """
-    Retorna URLs firmadas para que el frontend suba directo a Cloud Storage.
-    """
     user_id = current_user['uid']
     plan = await get_user_plan_unified(current_user)
     if plan == 'none': 
@@ -499,10 +545,9 @@ async def generate_upload_urls(
     return {"urls": urls_response}
 
 
-# --- ENDPOINTS ---
 @app.post("/analyze/")
 async def analyze_documents(
-    files_data: str = Form(...), # NUEVO: Recibe JSON con URIs de Google Cloud Storage
+    files_data: str = Form(...),
     instructions: str = Form(...),
     analysis_id: str = Form(""),
     history_json: str = Form(""),
@@ -519,31 +564,44 @@ async def analyze_documents(
     except:
         raise HTTPException(400, "Formato de metadatos de archivos inválido.")
 
-    # Verificación de cantidad de archivos
     num_files = len(files_info)
     max_docs = DOCS_LIMITS.get(plan, 0)
     if max_docs != -1 and num_files > max_docs:
         raise HTTPException(status_code=403, detail=f"Tu plan {plan.capitalize()} solo permite analizar {max_docs} documento(s) a la vez.")
 
-    # 🛡️ CONSUMO ATÓMICO PREVIO (Previene bypass de concurrencia)
     await consume_analysis_credit(user_id, plan)
 
-    # 3. Procesar Archivos desde GCS
     model_parts = []
     original_filenames = []
+    bucket = storage_client.bucket(GCS_BUCKET_NAME)
 
     for f_info in files_info:
         gs_uri = f_info.get("gs_uri")
         mime_type = f_info.get("mime_type", "application/pdf")
         original_filename = f_info.get("filename", "documento")
         
+        try:
+            blob_path = "/".join(gs_uri.replace("gs://", "").split("/")[1:])
+            blob = bucket.get_blob(blob_path)
+            
+            if blob:
+                file_size_mb = blob.size / (1024 * 1024)
+                if file_size_mb > MAX_FILE_SIZE_MB:
+                    blob.delete()
+                    raise HTTPException(
+                        status_code=400, 
+                        detail=f"El archivo '{original_filename}' pesa {file_size_mb:.2f} MB, superando el límite de {MAX_FILE_SIZE_MB} MB."
+                    )
+        except HTTPException as he:
+            raise he
+        except Exception as e:
+            print(f"Error verificando tamaño en GCS: {e}")
+
         original_filenames.append(original_filename)
         
         if mime_type == "application/pdf":
-            # GCS y Gemini leen el PDF de forma nativa e integrada
             model_parts.append(Part.from_uri(uri=gs_uri, mime_type="application/pdf"))
         else:
-            # Los DOCX son ligeros, los bajamos temporalmente a memoria
             text = await asyncio.to_thread(download_and_parse_docx, gs_uri)
             model_parts.append(f"--- DOC: {original_filename} ---\n{text}\n------\n")
 
@@ -560,10 +618,9 @@ async def analyze_documents(
     gen_config = {
         "temperature": float(os.getenv("GEMINI_TEMP", "0.4")),
         "top_p": float(os.getenv("GEMINI_TOP_P", "0.95")),
-        "max_output_tokens": 65535 # <--- AQUÍ ESTÁ EL CAMBIO DE TOKENS
+        "max_output_tokens": 65535 
     }
 
-    # 🛡️ GENERADOR CONSTRUIDO CON PROTECCIÓN DE REEMBOLSO
     async def counted_stream_generator():
         has_error = False
         tokens_sent = False
@@ -592,8 +649,7 @@ async def download_analysis(
     plan = await get_user_plan_unified(current_user)
     if plan == 'none': raise HTTPException(403, "Sin acceso")
 
-    # 🛡️ PROTECCIÓN CONTRA INYECCIÓN DE TEXTO / DoS
-    if len(analysis_text) > 500000: # <--- AQUÍ ESTÁ EL CAMBIO DE LÍMITE DE DESCARGA
+    if len(analysis_text) > 500000:
         analysis_text = analysis_text[:500000] + "\n\n[Texto truncado por límite de seguridad]"
     if len(instructions) > 5000:
         instructions = instructions[:5000] + "..."
@@ -647,4 +703,4 @@ async def delete_analysis(analysis_id: str, current_user: Dict[str, Any] = Depen
 
 @app.get("/")
 def read_root():
-    return {"status": "ok", "msg": "API Analizador v2.1 (GCS Storage Integrado)"}
+    return {"status": "ok", "msg": "API Analizador v2.1 (GCS Storage Integrado + Compresión PyMuPDF)"}
