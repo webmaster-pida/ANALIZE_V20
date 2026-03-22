@@ -5,7 +5,7 @@ import json
 import io
 import re
 import asyncio
-import fitz  # NUEVO: PyMuPDF para comprimir PDFs
+import fitz  # PyMuPDF para comprimir PDFs
 from fastapi import FastAPI, File, Form, UploadFile, HTTPException, Response, Depends, Body
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse 
@@ -90,6 +90,12 @@ LIMIT_PREMIUM_ANALYSIS_DAILY = int(os.getenv("LIMIT_PREMIUM_ANALYSIS_DAILY", 25)
 LIMIT_BASICO_DOCS = int(os.getenv("LIMIT_BASICO_DOCS", 1))
 LIMIT_AVANZADO_DOCS = int(os.getenv("LIMIT_AVANZADO_DOCS", 3))
 LIMIT_PREMIUM_DOCS = int(os.getenv("LIMIT_PREMIUM_DOCS", 5))
+
+# --- CONFIGURACIÓN DE SEGURIDAD DE ARCHIVOS ---
+try:
+    MAX_FILE_SIZE_MB = int(os.getenv("MAX_FILE_SIZE_MB", "50"))
+except ValueError:
+    MAX_FILE_SIZE_MB = 50
 
 # --- CORS ---
 raw_origins = os.getenv("ALLOWED_ORIGINS", '["https://pida-ai.com"]')
@@ -258,7 +264,6 @@ def write_markdown_to_pdf(pdf, text):
                 else:
                     pdf.write(6, part)
             pdf.ln(6)
-
         else:
             parts = re.split(r'(\*\*.*?\*\*)', line)
             for part in parts:
@@ -425,16 +430,13 @@ async def stream_analysis_generator(model, model_parts, gen_config, safety_setti
 
 # =========================================================================
 # ENDPOINT DE COMPRESIÓN DE PDF (PyMuPDF)
+# CUIDADO: Fíjate que el decorador NO tiene barra al final
 # =========================================================================
-@app.post("/compress-and-upload") # <-- Sin barra final para evitar 404
+@app.post("/compress-and-upload")
 async def compress_and_upload(
     file: UploadFile = File(...),
     current_user: Dict[str, Any] = Depends(get_current_user)
 ):
-    """
-    Recibe un PDF pesado, lo comprime en memoria usando PyMuPDF
-    y lo sube a GCS, retornando la URL de Storage (gs_uri).
-    """
     user_id = current_user['uid']
     plan = await get_user_plan_unified(current_user)
     if plan == 'none': 
@@ -474,7 +476,7 @@ async def compress_and_upload(
         raise HTTPException(status_code=500, detail=f"Error optimizando el documento: {str(e)}")
 
 
-@app.post("/generate-upload-urls") # <-- Sin barra final
+@app.post("/generate-upload-urls")
 async def generate_upload_urls(
     payload: Dict[str, Any] = Body(...),
     current_user: Dict[str, Any] = Depends(get_current_user)
@@ -516,7 +518,7 @@ async def generate_upload_urls(
     return {"urls": urls_response}
 
 
-@app.post("/analyze") # <-- Sin barra final
+@app.post("/analyze")
 async def analyze_documents(
     files_data: str = Form(...), 
     instructions: str = Form(...),
@@ -544,12 +546,30 @@ async def analyze_documents(
 
     model_parts = []
     original_filenames = []
+    bucket = storage_client.bucket(GCS_BUCKET_NAME)
 
     for f_info in files_info:
         gs_uri = f_info.get("gs_uri")
         mime_type = f_info.get("mime_type", "application/pdf")
         original_filename = f_info.get("filename", "documento")
         
+        try:
+            blob_path = "/".join(gs_uri.replace("gs://", "").split("/")[1:])
+            blob = bucket.get_blob(blob_path)
+            
+            if blob:
+                file_size_mb = blob.size / (1024 * 1024)
+                if file_size_mb > MAX_FILE_SIZE_MB:
+                    blob.delete()
+                    raise HTTPException(
+                        status_code=400, 
+                        detail=f"El archivo '{original_filename}' pesa {file_size_mb:.2f} MB, superando el límite de {MAX_FILE_SIZE_MB} MB."
+                    )
+        except HTTPException as he:
+            raise he
+        except Exception as e:
+            print(f"Error verificando tamaño en GCS: {e}")
+
         original_filenames.append(original_filename)
         
         if mime_type == "application/pdf":
