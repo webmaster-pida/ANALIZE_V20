@@ -37,8 +37,6 @@ try:
     raw_credentials, project_id_default = google.auth.default()
     PROJECT_ID = os.getenv("PROJECT_ID", project_id_default)
     
-    # 🛡️ FIX: Si estamos en Cloud Run, las credenciales por defecto no pueden firmar.
-    # Necesitamos "impersonar" la cuenta de servicio para que use la API de IAM internamente.
     from google.auth.compute_engine.credentials import Credentials as ComputeEngineCredentials
     from google.auth import impersonated_credentials
     
@@ -51,7 +49,6 @@ try:
             lifetime=3600
         )
     else:
-        # Para desarrollo local si usas llaves JSON
         credentials = raw_credentials
 
 except Exception as e:
@@ -61,12 +58,11 @@ except Exception as e:
 
 LOCATION = os.getenv("GOOGLE_CLOUD_LOCATION", "us-central1")
 GEMINI_MODEL_NAME = os.getenv("GEMINI_MODEL", "gemini-2.5-pro").strip()
-GCS_BUCKET_NAME = os.getenv("GCS_BUCKET_NAME", "pida-ai-temp-docs") # Nombre del bucket
+GCS_BUCKET_NAME = os.getenv("GCS_BUCKET_NAME", "pida-ai-temp-docs")
 
 if PROJECT_ID:
     try:
         vertexai.init(project=PROJECT_ID, location=LOCATION)
-        # Cliente de Storage con credenciales impersonadas
         storage_client = storage.Client(project=PROJECT_ID, credentials=credentials) 
         print(f"Vertex AI y Storage inicializados: {PROJECT_ID}")
     except Exception as e:
@@ -75,7 +71,7 @@ if PROJECT_ID:
 # Inicializar Firestore
 db = AsyncClient(project=PROJECT_ID)
 
-# --- LÍMITES CONFIGURABLES (IGUAL QUE EN CHATv20) ---
+# --- LÍMITES CONFIGURABLES ---
 DAILY_LIMIT_BASICO = int(os.getenv("DAILY_LIMIT_BASICO", "3"))
 DOCS_LIMIT_BASICO = int(os.getenv("DOCS_LIMIT_BASICO", "1"))
 
@@ -87,8 +83,6 @@ DOCS_LIMIT_PREMIUM = int(os.getenv("DOCS_LIMIT_PREMIUM", "5"))
 
 app = FastAPI(title="PIDA Document Analyzer (Streaming & GCS)")
 
-# --- VARIABLES DE LÍMITES (Desde Cloud Run) ---
-# Valores por defecto de seguridad
 LIMIT_BASICO_ANALYSIS_DAILY = int(os.getenv("LIMIT_BASICO_ANALYSIS_DAILY", 3))
 LIMIT_AVANZADO_ANALYSIS_DAILY = int(os.getenv("LIMIT_AVANZADO_ANALYSIS_DAILY", 15))
 LIMIT_PREMIUM_ANALYSIS_DAILY = int(os.getenv("LIMIT_PREMIUM_ANALYSIS_DAILY", 25))
@@ -96,12 +90,6 @@ LIMIT_PREMIUM_ANALYSIS_DAILY = int(os.getenv("LIMIT_PREMIUM_ANALYSIS_DAILY", 25)
 LIMIT_BASICO_DOCS = int(os.getenv("LIMIT_BASICO_DOCS", 1))
 LIMIT_AVANZADO_DOCS = int(os.getenv("LIMIT_AVANZADO_DOCS", 3))
 LIMIT_PREMIUM_DOCS = int(os.getenv("LIMIT_PREMIUM_DOCS", 5))
-
-# --- CONFIGURACIÓN DE SEGURIDAD DE ARCHIVOS ---
-try:
-    MAX_FILE_SIZE_MB = int(os.getenv("MAX_FILE_SIZE_MB", "50"))
-except ValueError:
-    MAX_FILE_SIZE_MB = 50
 
 # --- CORS ---
 raw_origins = os.getenv("ALLOWED_ORIGINS", '["https://pida-ai.com"]')
@@ -120,12 +108,11 @@ app.add_middleware(
     expose_headers=["Content-Disposition"],
 )
 
-# --- MAPAS DE LÍMITES ---
 ANALYSIS_LIMITS = {
     "basico": LIMIT_BASICO_ANALYSIS_DAILY,
     "avanzado": LIMIT_AVANZADO_ANALYSIS_DAILY,
     "premium": LIMIT_PREMIUM_ANALYSIS_DAILY,
-    "vip": -1  # Ilimitado
+    "vip": -1 
 }
 
 DOCS_LIMITS = {
@@ -138,21 +125,15 @@ DOCS_LIMITS = {
 # --- FUNCIONES DE UTILIDAD Y CONTROL ---
 
 def get_date_utc_minus_6() -> str:
-    """Devuelve la fecha actual ajustada a UTC-6"""
     utc_now = datetime.now(timezone.utc)
     cst_now = utc_now - timedelta(hours=6)
     return cst_now.strftime('%Y-%m-%d')
 
 async def get_user_plan_unified(current_user: Dict[str, Any]) -> str:
-    """
-    Determina el plan del usuario unificando lógica VIP y DB.
-    Retorna: 'vip', 'basico', 'avanzado', 'premium' o 'none'.
-    """
     user_id = current_user.get('uid')
     user_email = current_user.get('email', '').strip().lower()
     email_verified = current_user.get('email_verified', False)
     
-    # 1. VERIFICACIÓN VIP (Variables de Entorno)
     try:
         raw_domains = os.getenv("ADMIN_DOMAINS", '[]')
         raw_emails = os.getenv("ADMIN_EMAILS", '[]')
@@ -163,11 +144,9 @@ async def get_user_plan_unified(current_user: Dict[str, Any]) -> str:
 
     email_domain = user_email.split("@")[-1] if "@" in user_email else ""
     
-    # 🛡️ PROTECCIÓN: Exigir email_verified
     if email_verified and ((email_domain in admin_domains) or (user_email in admin_emails)):
         return 'vip'
 
-    # 2. VERIFICACIÓN FIRESTORE (Documento de Cliente)
     try:
         cust_doc = await db.collection('customers').document(user_id).get()
         if cust_doc.exists:
@@ -179,12 +158,11 @@ async def get_user_plan_unified(current_user: Dict[str, Any]) -> str:
     except Exception as e:
         print(f"Error consultando plan en DB: {e}")
         
-    return 'none' # Sin acceso
+    return 'none'
 
-# 🛡️ NUEVAS FUNCIONES DE CONSUMO ATÓMICO Y REEMBOLSO (Mitigación DoS y ByPass)
 async def consume_analysis_credit(user_id: str, plan_key: str):
     limit_daily = ANALYSIS_LIMITS.get(plan_key, 0)
-    if limit_daily == -1: return # VIP Ilimitado
+    if limit_daily == -1: return 
 
     today = get_date_utc_minus_6()
     stats_ref = db.collection('users').document(user_id).collection('usage_stats').document(today)
@@ -225,7 +203,6 @@ async def refund_analysis_credit(user_id: str):
     except Exception as e:
         print(f"Error en reembolso de análisis: {e}")
 
-# --- UTILIDADES DE NOMBRE DE ARCHIVO ---
 def generate_filename(instructions: str, extension: str) -> str:
     safe_title = re.sub(r'[^a-zA-Z0-9áéíóúÁÉÍÓÚñÑ ]', '', instructions[:40])
     safe_title = safe_title.strip().replace(' ', '_')
@@ -234,7 +211,6 @@ def generate_filename(instructions: str, extension: str) -> str:
     timestamp = datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
     return f"{safe_title}_{timestamp}.{extension}"
 
-# --- UTILIDADES DE LIMPIEZA TEXTO ---
 def sanitize_text_for_pdf(text: str) -> str:
     if not text: return ""
     replacements = {
@@ -245,7 +221,6 @@ def sanitize_text_for_pdf(text: str) -> str:
         text = text.replace(char, replacement)
     return text.encode('latin1', 'replace').decode('latin-1')
 
-# --- PARSER DE MARKDOWN PARA PDF ---
 def write_markdown_to_pdf(pdf, text):
     pdf.set_font("Arial", "", 11)
     
@@ -312,7 +287,6 @@ def parse_and_add_markdown_to_docx(document, markdown_text):
                 else:
                     p.add_run(part)
 
-# --- CLASE PDF ---
 class PDF(FPDF):
     def header(self):
         self.set_font("Arial", "B", 14)
@@ -329,7 +303,6 @@ class PDF(FPDF):
         self.set_text_color(128, 128, 128)
         self.cell(0, 10, f"Pagina {self.page_no()}/{{nb}}", 0, 0, "C")
 
-# --- FUNCIONES ASÍNCRONAS (SYNC WRAPPERS) ---
 def read_docx_sync(content: bytes) -> str:
     try:
         doc = Document(io.BytesIO(content))
@@ -451,9 +424,9 @@ async def stream_analysis_generator(model, model_parts, gen_config, safety_setti
 
 
 # =========================================================================
-# ENDPOINT DE COMPRESIÓN DE PDF (PyMuPDF) PARA DOCUMENTOS > 10MB
+# ENDPOINT DE COMPRESIÓN DE PDF (PyMuPDF)
 # =========================================================================
-@app.post("/compress-and-upload/")
+@app.post("/compress-and-upload") # <-- Sin barra final para evitar 404
 async def compress_and_upload(
     file: UploadFile = File(...),
     current_user: Dict[str, Any] = Depends(get_current_user)
@@ -471,13 +444,11 @@ async def compress_and_upload(
     original_size = len(file_bytes) / (1024 * 1024)
 
     try:
-        # Función síncrona para correr en un hilo y no bloquear el Event Loop de FastAPI
         def compress_pdf(data: bytes) -> bytes:
             if file.content_type != "application/pdf":
                 return data
             
             doc = fitz.open(stream=data, filetype="pdf")
-            # garbage=4: Elimina objetos muertos/duplicados. deflate=True: Comprime flujos/imágenes
             return doc.tobytes(garbage=4, deflate=True)
 
         compressed_bytes = await asyncio.to_thread(compress_pdf, file_bytes)
@@ -503,7 +474,7 @@ async def compress_and_upload(
         raise HTTPException(status_code=500, detail=f"Error optimizando el documento: {str(e)}")
 
 
-@app.post("/generate-upload-urls/")
+@app.post("/generate-upload-urls") # <-- Sin barra final
 async def generate_upload_urls(
     payload: Dict[str, Any] = Body(...),
     current_user: Dict[str, Any] = Depends(get_current_user)
@@ -545,9 +516,9 @@ async def generate_upload_urls(
     return {"urls": urls_response}
 
 
-@app.post("/analyze/")
+@app.post("/analyze") # <-- Sin barra final
 async def analyze_documents(
-    files_data: str = Form(...),
+    files_data: str = Form(...), 
     instructions: str = Form(...),
     analysis_id: str = Form(""),
     history_json: str = Form(""),
@@ -573,30 +544,12 @@ async def analyze_documents(
 
     model_parts = []
     original_filenames = []
-    bucket = storage_client.bucket(GCS_BUCKET_NAME)
 
     for f_info in files_info:
         gs_uri = f_info.get("gs_uri")
         mime_type = f_info.get("mime_type", "application/pdf")
         original_filename = f_info.get("filename", "documento")
         
-        try:
-            blob_path = "/".join(gs_uri.replace("gs://", "").split("/")[1:])
-            blob = bucket.get_blob(blob_path)
-            
-            if blob:
-                file_size_mb = blob.size / (1024 * 1024)
-                if file_size_mb > MAX_FILE_SIZE_MB:
-                    blob.delete()
-                    raise HTTPException(
-                        status_code=400, 
-                        detail=f"El archivo '{original_filename}' pesa {file_size_mb:.2f} MB, superando el límite de {MAX_FILE_SIZE_MB} MB."
-                    )
-        except HTTPException as he:
-            raise he
-        except Exception as e:
-            print(f"Error verificando tamaño en GCS: {e}")
-
         original_filenames.append(original_filename)
         
         if mime_type == "application/pdf":
@@ -618,7 +571,7 @@ async def analyze_documents(
     gen_config = {
         "temperature": float(os.getenv("GEMINI_TEMP", "0.4")),
         "top_p": float(os.getenv("GEMINI_TOP_P", "0.95")),
-        "max_output_tokens": 65535 
+        "max_output_tokens": 65535
     }
 
     async def counted_stream_generator():
