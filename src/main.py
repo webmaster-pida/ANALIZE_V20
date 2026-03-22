@@ -71,31 +71,26 @@ if PROJECT_ID:
 # Inicializar Firestore
 db = AsyncClient(project=PROJECT_ID)
 
-# --- LÍMITES CONFIGURABLES ---
-DAILY_LIMIT_BASICO = int(os.getenv("DAILY_LIMIT_BASICO", "3"))
-DOCS_LIMIT_BASICO = int(os.getenv("DOCS_LIMIT_BASICO", "1"))
-
-DAILY_LIMIT_AVANZADO = int(os.getenv("DAILY_LIMIT_AVANZADO", "15"))
-DOCS_LIMIT_AVANZADO = int(os.getenv("DOCS_LIMIT_AVANZADO", "3"))
-
-DAILY_LIMIT_PREMIUM = int(os.getenv("DAILY_LIMIT_PREMIUM", "25"))
-DOCS_LIMIT_PREMIUM = int(os.getenv("DOCS_LIMIT_PREMIUM", "5"))
-
 app = FastAPI(title="PIDA Document Analyzer (Streaming & GCS)")
 
+# --- VARIABLES DE LÍMITES DE NEGOCIO (Desde Variables de Entorno) ---
+
+# 1. Límites de Análisis Diarios
 LIMIT_BASICO_ANALYSIS_DAILY = int(os.getenv("LIMIT_BASICO_ANALYSIS_DAILY", 3))
 LIMIT_AVANZADO_ANALYSIS_DAILY = int(os.getenv("LIMIT_AVANZADO_ANALYSIS_DAILY", 15))
 LIMIT_PREMIUM_ANALYSIS_DAILY = int(os.getenv("LIMIT_PREMIUM_ANALYSIS_DAILY", 25))
 
+# 2. Límites de Documentos por Análisis (Múltiples archivos)
 LIMIT_BASICO_DOCS = int(os.getenv("LIMIT_BASICO_DOCS", 1))
 LIMIT_AVANZADO_DOCS = int(os.getenv("LIMIT_AVANZADO_DOCS", 3))
 LIMIT_PREMIUM_DOCS = int(os.getenv("LIMIT_PREMIUM_DOCS", 5))
 
-# --- CONFIGURACIÓN DE SEGURIDAD DE ARCHIVOS ---
-try:
-    MAX_FILE_SIZE_MB = int(os.getenv("MAX_FILE_SIZE_MB", "50"))
-except ValueError:
-    MAX_FILE_SIZE_MB = 50
+# 3. LÍMITES DE PESO EN MB POR PLAN (Profesional y Dinámico)
+LIMIT_SIZE_MB_BASICO = int(os.getenv("LIMIT_SIZE_MB_BASICO", 10))
+LIMIT_SIZE_MB_AVANZADO = int(os.getenv("LIMIT_SIZE_MB_AVANZADO", 50))
+LIMIT_SIZE_MB_PREMIUM = int(os.getenv("LIMIT_SIZE_MB_PREMIUM", 50))
+LIMIT_SIZE_MB_VIP = int(os.getenv("LIMIT_SIZE_MB_VIP", 50))
+
 
 # --- CORS ---
 raw_origins = os.getenv("ALLOWED_ORIGINS", '["https://pida-ai.com"]')
@@ -114,6 +109,7 @@ app.add_middleware(
     expose_headers=["Content-Disposition"],
 )
 
+# --- MAPAS DE LÍMITES DE NEGOCIO ---
 ANALYSIS_LIMITS = {
     "basico": LIMIT_BASICO_ANALYSIS_DAILY,
     "avanzado": LIMIT_AVANZADO_ANALYSIS_DAILY,
@@ -126,6 +122,13 @@ DOCS_LIMITS = {
     "avanzado": LIMIT_AVANZADO_DOCS,
     "premium": LIMIT_PREMIUM_DOCS,
     "vip": 100 
+}
+
+PLAN_SIZE_LIMITS = {
+    "basico": LIMIT_SIZE_MB_BASICO,
+    "avanzado": LIMIT_SIZE_MB_AVANZADO,
+    "premium": LIMIT_SIZE_MB_PREMIUM,
+    "vip": LIMIT_SIZE_MB_VIP
 }
 
 # --- FUNCIONES DE UTILIDAD Y CONTROL ---
@@ -428,10 +431,6 @@ async def stream_analysis_generator(model, model_parts, gen_config, safety_setti
         yield f"data: {json.dumps({'error': str(e)})}\n\n"
 
 
-# =========================================================================
-# ENDPOINT DE COMPRESIÓN DE PDF (PyMuPDF)
-# CUIDADO: Fíjate que el decorador NO tiene barra al final
-# =========================================================================
 @app.post("/compress-and-upload")
 async def compress_and_upload(
     file: UploadFile = File(...),
@@ -442,14 +441,22 @@ async def compress_and_upload(
     if plan == 'none': 
         raise HTTPException(status_code=403, detail="Plan inactivo.")
 
+    # Obtenemos el límite dinámico de forma profesional
+    max_size_mb = PLAN_SIZE_LIMITS.get(plan, 10)
+
     file_bytes = await file.read()
     original_size = len(file_bytes) / (1024 * 1024)
+
+    if original_size > max_size_mb:
+        raise HTTPException(
+            status_code=400, 
+            detail=f"EXCEDE_TAMANO: El archivo pesa {original_size:.2f} MB. Tu plan ({plan.upper()}) permite un máximo de {max_size_mb} MB por documento."
+        )
 
     try:
         def compress_pdf(data: bytes) -> bytes:
             if file.content_type != "application/pdf":
                 return data
-            
             doc = fitz.open(stream=data, filetype="pdf")
             return doc.tobytes(garbage=4, deflate=True)
 
@@ -544,6 +551,9 @@ async def analyze_documents(
 
     await consume_analysis_credit(user_id, plan)
 
+    # Obtenemos el límite dinámico según el plan
+    max_size_mb = PLAN_SIZE_LIMITS.get(plan, 10)
+
     model_parts = []
     original_filenames = []
     bucket = storage_client.bucket(GCS_BUCKET_NAME)
@@ -559,11 +569,11 @@ async def analyze_documents(
             
             if blob:
                 file_size_mb = blob.size / (1024 * 1024)
-                if file_size_mb > MAX_FILE_SIZE_MB:
+                if file_size_mb > max_size_mb:
                     blob.delete()
                     raise HTTPException(
                         status_code=400, 
-                        detail=f"El archivo '{original_filename}' pesa {file_size_mb:.2f} MB, superando el límite de {MAX_FILE_SIZE_MB} MB."
+                        detail=f"EXCEDE_TAMANO: El archivo '{original_filename}' pesa {file_size_mb:.2f} MB. Tu plan ({plan.upper()}) permite un máximo de {max_size_mb} MB por documento."
                     )
         except HTTPException as he:
             raise he
@@ -676,4 +686,4 @@ async def delete_analysis(analysis_id: str, current_user: Dict[str, Any] = Depen
 
 @app.get("/")
 def read_root():
-    return {"status": "ok", "msg": "API Analizador v2.1 (GCS Storage Integrado + Compresión PyMuPDF)"}
+    return {"status": "ok", "msg": "API Analizador v2.1 (Límites por EnvVars + Compresión)"}
