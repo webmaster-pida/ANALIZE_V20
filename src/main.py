@@ -153,7 +153,8 @@ async def get_user_plan_unified(current_user: Dict[str, Any]) -> str:
 
     email_domain = user_email.split("@")[-1] if "@" in user_email else ""
     
-    if email_verified and ((email_domain in admin_domains) or (user_email in admin_emails)):
+    # 🛡️ CAMBIO AQUÍ: Se eliminó email_verified and
+    if (email_domain in admin_domains) or (user_email in admin_emails):
         return 'vip'
 
     try:
