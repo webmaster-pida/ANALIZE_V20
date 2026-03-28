@@ -180,7 +180,10 @@ async def consume_analysis_credit(user_id: str, plan_key: str):
     @firestore.async_transactional
     async def check_and_increment(transaction, ref):
         snapshot = await ref.get(transaction=transaction)
-        current_count = snapshot.get('analysis_count') if snapshot.exists else 0
+        
+        # SOLUCIÓN: Convertir a diccionario seguro
+        data = snapshot.to_dict() if snapshot.exists else {}
+        current_count = data.get('analysis_count', 0)
         
         if current_count >= limit_daily:
             raise HTTPException(status_code=429, detail=f"Límite diario alcanzado para el plan {plan_key}")
@@ -201,7 +204,10 @@ async def refund_analysis_credit(user_id: str):
     async def check_and_decrement(transaction, ref):
         snapshot = await ref.get(transaction=transaction)
         if snapshot.exists:
-            current_count = snapshot.get('analysis_count', 0)
+            # SOLUCIÓN: Convertir a diccionario seguro
+            data = snapshot.to_dict() or {}
+            current_count = data.get('analysis_count', 0)
+            
             if current_count > 0:
                 transaction.update(ref, {
                     'analysis_count': current_count - 1,
