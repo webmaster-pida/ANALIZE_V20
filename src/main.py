@@ -631,13 +631,63 @@ async def analyze_documents(
 
 @app.post("/download-analysis")
 async def download_analysis(
-    analysis_text: str = Form(...),
-    instructions: str = Form(...),
+    history_json: str = Form(None),
+    analysis_id: str = Form(None),
     file_format: str = Form("docx"),
     current_user: Dict[str, Any] = Depends(get_current_user)
 ):
     plan = await get_user_plan_unified(current_user)
     if plan == 'none': raise HTTPException(403, "Sin acceso")
+
+    analysis_text = ""
+    instructions = "Exportación de Análisis PIDA"
+
+    # 1. Recuperar datos (Priorizamos el history_json enviado por el Frontend)
+    if history_json:
+        try:
+            messages = json.loads(history_json)
+            chat_lines = []
+            for idx, msg in enumerate(messages):
+                role = msg.get("role")
+                content = msg.get("content", "")
+                if idx == 0 and role == "user":
+                    instructions = content
+                else:
+                    role_str = "Instrucción" if role == "user" else "Análisis PIDA"
+                    chat_lines.append(f"**{role_str}:**\n{content}")
+            analysis_text = "\n\n".join(chat_lines)
+        except Exception as e:
+            print(f"Error parseando history_json: {e}")
+
+    # 2. Si no viene el JSON, intentar con el ID de la base de datos
+    if not analysis_text and analysis_id:
+        doc_ref = db.collection("analysis_history").document(analysis_id)
+        doc_snap = await doc_ref.get()
+        if doc_snap.exists:
+            data = doc_snap.to_dict()
+            instructions = data.get("instructions", instructions)
+            
+            raw_ana = data.get("analysis", "")
+            try:
+                parsed_ana = json.loads(raw_ana)
+                if isinstance(parsed_ana, list):
+                    chat_lines = []
+                    for idx, msg in enumerate(parsed_ana):
+                        role = msg.get("role")
+                        content = msg.get("content", "")
+                        if idx == 0 and role == "user":
+                            instructions = content
+                        else:
+                            role_str = "Instrucción" if role == "user" else "Análisis PIDA"
+                            chat_lines.append(f"**{role_str}:**\n{content}")
+                    analysis_text = "\n\n".join(chat_lines)
+                else:
+                    analysis_text = raw_ana
+            except:
+                analysis_text = raw_ana
+
+    if not analysis_text:
+        raise HTTPException(status_code=400, detail="No hay contenido válido para descargar.")
 
     if len(analysis_text) > 500000:
         analysis_text = analysis_text[:500000] + "\n\n[Texto truncado por límite de seguridad]"
@@ -652,6 +702,7 @@ async def download_analysis(
         return Response(content=content, media_type=mime, headers={"Content-Disposition": f"attachment; filename={fname}"})
     except Exception as e:
         raise HTTPException(500, f"Error descarga: {e}")
+
 
 @app.get("/analysis-history/")
 async def get_analysis_history(current_user: Dict[str, Any] = Depends(get_current_user)):
