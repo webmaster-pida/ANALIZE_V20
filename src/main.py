@@ -236,18 +236,23 @@ def write_markdown_to_pdf(pdf, text):
             pdf.ln(5)
             continue
         
-        # PROCESAR TABLAS EN PDF
+        # PROCESAR TABLAS EN PDF (CORREGIDO PARA COMPATIBILIDAD CON FPDF CLÁSICO)
         if line.startswith('|') and line.endswith('|'):
             cells = [c.strip() for c in line.split('|')[1:-1]]
             if all(re.match(r'^:?-+:?$', c) for c in cells):
                 continue
             
             if len(cells) > 0:
-                col_width = pdf.epw / len(cells)
+                # Calculamos el ancho de forma segura sin usar epw
+                ancho_efectivo = pdf.w - pdf.l_margin - pdf.r_margin
+                col_width = ancho_efectivo / len(cells)
+                
                 for cell in cells:
                     clean_cell = cell.replace('**', '')
+                    # Truncamos el texto si es muy largo para que no rompa la celda
                     if len(clean_cell) > 50: clean_cell = clean_cell[:47] + "..."
-                    pdf.multi_cell(col_width, 6, clean_cell, border=1, ln=3)
+                    # ln=0 permite imprimir celdas lado a lado sin colapsar
+                    pdf.cell(col_width, 6, clean_cell, border=1, ln=0)
                 pdf.ln(6)
             continue
             
@@ -297,7 +302,7 @@ def parse_and_add_markdown_to_docx(document, markdown_text):
     for line in markdown_text.strip().split('\n'):
         line = line.strip()
         
-        # PROCESAR TABLAS EN DOCX
+        # PROCESAR TABLAS EN DOCX (CON PREVENCIÓN DE ERRORES)
         if line.startswith('|') and line.endswith('|'):
             cells = [c.strip() for c in line.split('|')[1:-1]]
             if all(re.match(r'^:?-+:?$', c) for c in cells):
@@ -306,7 +311,11 @@ def parse_and_add_markdown_to_docx(document, markdown_text):
             if not in_table:
                 in_table = True
                 table = document.add_table(rows=1, cols=len(cells))
-                table.style = 'Table Grid'
+                # Intentamos aplicar el estilo, si la plantilla no lo trae, ignoramos
+                try:
+                    table.style = 'Table Grid'
+                except:
+                    pass
                 row_cells = table.rows[0].cells
                 for i, c in enumerate(cells):
                     if i < len(row_cells): row_cells[i].text = c.replace('**', '')
@@ -662,6 +671,7 @@ async def download_analysis(
     instructions: str = Form("Exportación de Análisis PIDA"),
     history_json: str = Form(""),
     file_format: str = Form("docx"),
+    analysis_id: Optional[str] = Form(None), # CORRECCIÓN: Agregado para que no de error 422 si el frontend lo envía
     current_user: Dict[str, Any] = Depends(get_current_user)
 ):
     plan = await get_user_plan_unified(current_user)
