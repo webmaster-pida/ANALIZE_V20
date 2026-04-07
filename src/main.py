@@ -73,19 +73,15 @@ db = AsyncClient(project=PROJECT_ID)
 
 app = FastAPI(title="PIDA Document Analyzer (Streaming & GCS)")
 
-# --- VARIABLES DE LÍMITES DE NEGOCIO (Desde Variables de Entorno) ---
-
-# 1. Límites de Análisis Diarios
+# --- VARIABLES DE LÍMITES DE NEGOCIO ---
 LIMIT_BASICO_ANALYSIS_DAILY = int(os.getenv("LIMIT_BASICO_ANALYSIS_DAILY", 3))
 LIMIT_AVANZADO_ANALYSIS_DAILY = int(os.getenv("LIMIT_AVANZADO_ANALYSIS_DAILY", 15))
 LIMIT_PREMIUM_ANALYSIS_DAILY = int(os.getenv("LIMIT_PREMIUM_ANALYSIS_DAILY", 25))
 
-# 2. Límites de Documentos por Análisis (Múltiples archivos)
 LIMIT_BASICO_DOCS = int(os.getenv("LIMIT_BASICO_DOCS", 1))
 LIMIT_AVANZADO_DOCS = int(os.getenv("LIMIT_AVANZADO_DOCS", 3))
 LIMIT_PREMIUM_DOCS = int(os.getenv("LIMIT_PREMIUM_DOCS", 5))
 
-# 3. LÍMITES DE PESO EN MB POR PLAN (Profesional y Dinámico)
 LIMIT_SIZE_MB_BASICO = int(os.getenv("LIMIT_SIZE_MB_BASICO", 10))
 LIMIT_SIZE_MB_AVANZADO = int(os.getenv("LIMIT_SIZE_MB_AVANZADO", 50))
 LIMIT_SIZE_MB_PREMIUM = int(os.getenv("LIMIT_SIZE_MB_PREMIUM", 50))
@@ -141,7 +137,6 @@ def get_date_utc_minus_6() -> str:
 async def get_user_plan_unified(current_user: Dict[str, Any]) -> str:
     user_id = current_user.get('uid')
     user_email = current_user.get('email', '').strip().lower()
-    email_verified = current_user.get('email_verified', False)
     
     try:
         raw_domains = os.getenv("ADMIN_DOMAINS", '[]')
@@ -153,7 +148,6 @@ async def get_user_plan_unified(current_user: Dict[str, Any]) -> str:
 
     email_domain = user_email.split("@")[-1] if "@" in user_email else ""
     
-    # 🛡️ CAMBIO AQUÍ: Se eliminó email_verified and
     if (email_domain in admin_domains) or (user_email in admin_emails):
         return 'vip'
 
@@ -180,8 +174,6 @@ async def consume_analysis_credit(user_id: str, plan_key: str):
     @firestore.async_transactional
     async def check_and_increment(transaction, ref):
         snapshot = await ref.get(transaction=transaction)
-        
-        # SOLUCIÓN: Convertir a diccionario seguro
         data = snapshot.to_dict() if snapshot.exists else {}
         current_count = data.get('analysis_count', 0)
         
@@ -204,10 +196,8 @@ async def refund_analysis_credit(user_id: str):
     async def check_and_decrement(transaction, ref):
         snapshot = await ref.get(transaction=transaction)
         if snapshot.exists:
-            # SOLUCIÓN: Convertir a diccionario seguro
             data = snapshot.to_dict() or {}
             current_count = data.get('analysis_count', 0)
-            
             if current_count > 0:
                 transaction.update(ref, {
                     'analysis_count': current_count - 1,
@@ -238,28 +228,43 @@ def sanitize_text_for_pdf(text: str) -> str:
     return text.encode('latin1', 'replace').decode('latin-1')
 
 def write_markdown_to_pdf(pdf, text):
-    pdf.set_font("Arial", "", 11)
+    pdf.set_font("Arial", "", 10)
     
     for line in text.split('\n'):
         line = line.strip()
         if not line:
             pdf.ln(5)
             continue
+        
+        # PROCESAR TABLAS EN PDF
+        if line.startswith('|') and line.endswith('|'):
+            cells = [c.strip() for c in line.split('|')[1:-1]]
+            if all(re.match(r'^:?-+:?$', c) for c in cells):
+                continue
+            
+            if len(cells) > 0:
+                col_width = pdf.epw / len(cells)
+                for cell in cells:
+                    clean_cell = cell.replace('**', '')
+                    if len(clean_cell) > 50: clean_cell = clean_cell[:47] + "..."
+                    pdf.multi_cell(col_width, 6, clean_cell, border=1, ln=3)
+                pdf.ln(6)
+            continue
             
         if line.startswith('## '):
             pdf.ln(3)
-            pdf.set_font("Arial", "B", 13)
+            pdf.set_font("Arial", "B", 12)
             pdf.set_text_color(29, 53, 87)
             pdf.multi_cell(0, 8, line.replace('## ', ''))
             pdf.set_text_color(0, 0, 0)
-            pdf.set_font("Arial", "", 11)
+            pdf.set_font("Arial", "", 10)
         elif line.startswith('# '):
             pdf.ln(5)
-            pdf.set_font("Arial", "B", 15)
+            pdf.set_font("Arial", "B", 14)
             pdf.set_text_color(185, 47, 50)
             pdf.multi_cell(0, 10, line.replace('# ', ''))
             pdf.set_text_color(0, 0, 0)
-            pdf.set_font("Arial", "", 11)
+            pdf.set_font("Arial", "", 10)
             
         elif line.startswith('* ') or line.startswith('- '):
             pdf.set_x(15)
@@ -268,9 +273,9 @@ def write_markdown_to_pdf(pdf, text):
             parts = re.split(r'(\*\*.*?\*\*)', clean_line)
             for part in parts:
                 if part.startswith('**') and part.endswith('**'):
-                    pdf.set_font("Arial", "B", 11)
+                    pdf.set_font("Arial", "B", 10)
                     pdf.write(6, part.strip('*'))
-                    pdf.set_font("Arial", "", 11)
+                    pdf.set_font("Arial", "", 10)
                 else:
                     pdf.write(6, part)
             pdf.ln(6)
@@ -278,29 +283,53 @@ def write_markdown_to_pdf(pdf, text):
             parts = re.split(r'(\*\*.*?\*\*)', line)
             for part in parts:
                 if part.startswith('**') and part.endswith('**'):
-                    pdf.set_font("Arial", "B", 11)
+                    pdf.set_font("Arial", "B", 10)
                     pdf.write(6, part.strip('*'))
-                    pdf.set_font("Arial", "", 11)
+                    pdf.set_font("Arial", "", 10)
                 else:
                     pdf.write(6, part)
             pdf.ln(6)
 
 def parse_and_add_markdown_to_docx(document, markdown_text):
+    in_table = False
+    table = None
+    
     for line in markdown_text.strip().split('\n'):
-        if line.startswith('## '):
-            document.add_heading(line.lstrip('## '), level=2)
-        elif line.startswith('# '):
-            document.add_heading(line.lstrip('# '), level=1)
-        elif not line.strip():
-            document.add_paragraph('')
+        line = line.strip()
+        
+        # PROCESAR TABLAS EN DOCX
+        if line.startswith('|') and line.endswith('|'):
+            cells = [c.strip() for c in line.split('|')[1:-1]]
+            if all(re.match(r'^:?-+:?$', c) for c in cells):
+                continue
+                
+            if not in_table:
+                in_table = True
+                table = document.add_table(rows=1, cols=len(cells))
+                table.style = 'Table Grid'
+                row_cells = table.rows[0].cells
+                for i, c in enumerate(cells):
+                    if i < len(row_cells): row_cells[i].text = c.replace('**', '')
+            else:
+                row_cells = table.add_row().cells
+                for i, c in enumerate(cells):
+                    if i < len(row_cells): row_cells[i].text = c.replace('**', '')
         else:
-            p = document.add_paragraph()
-            parts = re.split(r'(\*\*.*?\*\*)', line)
-            for part in parts:
-                if part.startswith('**') and part.endswith('**'):
-                    p.add_run(part.strip('*')).bold = True
-                else:
-                    p.add_run(part)
+            in_table = False
+            if line.startswith('## '):
+                document.add_heading(line.lstrip('## '), level=2)
+            elif line.startswith('# '):
+                document.add_heading(line.lstrip('# '), level=1)
+            elif not line.strip():
+                document.add_paragraph('')
+            else:
+                p = document.add_paragraph()
+                parts = re.split(r'(\*\*.*?\*\*)', line)
+                for part in parts:
+                    if part.startswith('**') and part.endswith('**'):
+                        p.add_run(part.strip('*')).bold = True
+                    else:
+                        p.add_run(part)
 
 class PDF(FPDF):
     def header(self):
@@ -448,7 +477,6 @@ async def compress_and_upload(
     if plan == 'none': 
         raise HTTPException(status_code=403, detail="Plan inactivo.")
 
-    # Obtenemos el límite dinámico de forma profesional
     max_size_mb = PLAN_SIZE_LIMITS.get(plan, 10)
 
     file_bytes = await file.read()
@@ -558,7 +586,6 @@ async def analyze_documents(
 
     await consume_analysis_credit(user_id, plan)
 
-    # Obtenemos el límite dinámico según el plan
     max_size_mb = PLAN_SIZE_LIMITS.get(plan, 10)
 
     model_parts = []
@@ -631,18 +658,15 @@ async def analyze_documents(
 
 @app.post("/download-analysis")
 async def download_analysis(
-    history_json: str = Form(None),
-    analysis_id: str = Form(None),
+    analysis_text: str = Form(""),
+    instructions: str = Form("Exportación de Análisis PIDA"),
+    history_json: str = Form(""),
     file_format: str = Form("docx"),
     current_user: Dict[str, Any] = Depends(get_current_user)
 ):
     plan = await get_user_plan_unified(current_user)
     if plan == 'none': raise HTTPException(403, "Sin acceso")
 
-    analysis_text = ""
-    instructions = "Exportación de Análisis PIDA"
-
-    # 1. Recuperar datos (Priorizamos el history_json enviado por el Frontend)
     if history_json:
         try:
             messages = json.loads(history_json)
@@ -659,36 +683,6 @@ async def download_analysis(
         except Exception as e:
             print(f"Error parseando history_json: {e}")
 
-    # 2. Si no viene el JSON, intentar con el ID de la base de datos
-    if not analysis_text and analysis_id:
-        doc_ref = db.collection("analysis_history").document(analysis_id)
-        doc_snap = await doc_ref.get()
-        if doc_snap.exists:
-            data = doc_snap.to_dict()
-            instructions = data.get("instructions", instructions)
-            
-            raw_ana = data.get("analysis", "")
-            try:
-                parsed_ana = json.loads(raw_ana)
-                if isinstance(parsed_ana, list):
-                    chat_lines = []
-                    for idx, msg in enumerate(parsed_ana):
-                        role = msg.get("role")
-                        content = msg.get("content", "")
-                        if idx == 0 and role == "user":
-                            instructions = content
-                        else:
-                            role_str = "Instrucción" if role == "user" else "Análisis PIDA"
-                            chat_lines.append(f"**{role_str}:**\n{content}")
-                    analysis_text = "\n\n".join(chat_lines)
-                else:
-                    analysis_text = raw_ana
-            except:
-                analysis_text = raw_ana
-
-    if not analysis_text:
-        raise HTTPException(status_code=400, detail="No hay contenido válido para descargar.")
-
     if len(analysis_text) > 500000:
         analysis_text = analysis_text[:500000] + "\n\n[Texto truncado por límite de seguridad]"
     if len(instructions) > 5000:
@@ -702,7 +696,6 @@ async def download_analysis(
         return Response(content=content, media_type=mime, headers={"Content-Disposition": f"attachment; filename={fname}"})
     except Exception as e:
         raise HTTPException(500, f"Error descarga: {e}")
-
 
 @app.get("/analysis-history/")
 async def get_analysis_history(current_user: Dict[str, Any] = Depends(get_current_user)):
