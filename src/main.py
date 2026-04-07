@@ -227,53 +227,86 @@ def sanitize_text_for_pdf(text: str) -> str:
         text = text.replace(char, replacement)
     return text.encode('latin1', 'replace').decode('latin-1')
 
+# --- NUEVA FUNCIÓN PARA TABLAS ROBUSTAS EN PDF ---
+def render_table_row_fpdf(pdf, cells):
+    ancho_efectivo = pdf.w - pdf.l_margin - pdf.r_margin
+    col_width = ancho_efectivo / len(cells)
+    line_height = 6
+    
+    # Procesar <br> generados por LLMs a verdaderos saltos de línea y quitar negritas para evitar fallos
+    processed_cells = [c.replace('<br>', '\n').replace('<br/>', '\n').replace('**', '').strip() for c in cells]
+    
+    # Determinar la altura máxima de la fila en base a la celda con más texto
+    max_lines = 1
+    for cell in processed_cells:
+        lines_in_cell = 0
+        for paragraph in cell.split('\n'):
+            chars_per_line = max(1, int(col_width / 2.2)) # Estimación para Arial 10
+            lines_in_cell += max(1, len(paragraph) // chars_per_line + 1)
+        if lines_in_cell > max_lines:
+            max_lines = lines_in_cell
+            
+    row_height = max_lines * line_height
+    
+    # Salto de página si no cabe
+    if pdf.get_y() + row_height > pdf.page_break_trigger:
+        pdf.add_page()
+        
+    start_x = pdf.get_x()
+    start_y = pdf.get_y()
+    
+    for cell in processed_cells:
+        x_before = pdf.get_x()
+        y_before = pdf.get_y()
+        
+        # 1. Dibujamos el recuadro completo
+        pdf.rect(x_before, y_before, col_width, row_height)
+        # 2. Imprimimos el texto adentro (multi_cell gestiona internamente los \n)
+        pdf.multi_cell(col_width, line_height, cell, border=0, align='L')
+        
+        # 3. Nos movemos a la siguiente columna sin bajar de fila
+        pdf.set_xy(x_before + col_width, start_y)
+        
+    # Al final, bajamos el cursor toda la altura calculada
+    pdf.set_xy(pdf.l_margin, start_y + row_height)
+
 def write_markdown_to_pdf(pdf, text):
     pdf.set_font("Arial", "", 10)
     
     for line in text.split('\n'):
-        line = line.strip()
-        if not line:
+        line_stripped = line.strip()
+        if not line_stripped:
             pdf.ln(5)
             continue
         
-        # PROCESAR TABLAS EN PDF (CORREGIDO PARA COMPATIBILIDAD CON FPDF CLÁSICO)
-        if line.startswith('|') and line.endswith('|'):
-            cells = [c.strip() for c in line.split('|')[1:-1]]
+        # DETECTAR Y DIBUJAR TABLAS EN PDF
+        if line_stripped.startswith('|') and line_stripped.endswith('|'):
+            cells = [c.strip() for c in line_stripped.split('|')[1:-1]]
             if all(re.match(r'^:?-+:?$', c) for c in cells):
-                continue
+                continue # Saltar la fila separadora de Markdown
             
             if len(cells) > 0:
-                # Calculamos el ancho de forma segura sin usar epw
-                ancho_efectivo = pdf.w - pdf.l_margin - pdf.r_margin
-                col_width = ancho_efectivo / len(cells)
-                
-                for cell in cells:
-                    clean_cell = cell.replace('**', '')
-                    # Truncamos el texto si es muy largo para que no rompa la celda
-                    if len(clean_cell) > 50: clean_cell = clean_cell[:47] + "..."
-                    # ln=0 permite imprimir celdas lado a lado sin colapsar
-                    pdf.cell(col_width, 6, clean_cell, border=1, ln=0)
-                pdf.ln(6)
+                render_table_row_fpdf(pdf, cells)
             continue
             
-        if line.startswith('## '):
+        if line_stripped.startswith('## '):
             pdf.ln(3)
             pdf.set_font("Arial", "B", 12)
             pdf.set_text_color(29, 53, 87)
-            pdf.multi_cell(0, 8, line.replace('## ', ''))
+            pdf.multi_cell(0, 8, line_stripped.replace('## ', ''))
             pdf.set_text_color(0, 0, 0)
             pdf.set_font("Arial", "", 10)
-        elif line.startswith('# '):
+        elif line_stripped.startswith('# '):
             pdf.ln(5)
             pdf.set_font("Arial", "B", 14)
             pdf.set_text_color(185, 47, 50)
-            pdf.multi_cell(0, 10, line.replace('# ', ''))
+            pdf.multi_cell(0, 10, line_stripped.replace('# ', ''))
             pdf.set_text_color(0, 0, 0)
             pdf.set_font("Arial", "", 10)
             
-        elif line.startswith('* ') or line.startswith('- '):
+        elif line_stripped.startswith('* ') or line_stripped.startswith('- '):
             pdf.set_x(15)
-            clean_line = line[2:]
+            clean_line = line_stripped[2:]
             pdf.write(6, "- ")
             parts = re.split(r'(\*\*.*?\*\*)', clean_line)
             for part in parts:
@@ -285,7 +318,7 @@ def write_markdown_to_pdf(pdf, text):
                     pdf.write(6, part)
             pdf.ln(6)
         else:
-            parts = re.split(r'(\*\*.*?\*\*)', line)
+            parts = re.split(r'(\*\*.*?\*\*)', line_stripped)
             for part in parts:
                 if part.startswith('**') and part.endswith('**'):
                     pdf.set_font("Arial", "B", 10)
@@ -300,40 +333,40 @@ def parse_and_add_markdown_to_docx(document, markdown_text):
     table = None
     
     for line in markdown_text.strip().split('\n'):
-        line = line.strip()
+        line_stripped = line.strip()
         
-        # PROCESAR TABLAS EN DOCX (CON PREVENCIÓN DE ERRORES)
-        if line.startswith('|') and line.endswith('|'):
-            cells = [c.strip() for c in line.split('|')[1:-1]]
+        # DETECTAR Y DIBUJAR TABLAS EN DOCX
+        if line_stripped.startswith('|') and line_stripped.endswith('|'):
+            cells = [c.strip() for c in line_stripped.split('|')[1:-1]]
             if all(re.match(r'^:?-+:?$', c) for c in cells):
                 continue
                 
+            # Procesar <br> a verdaderos saltos de línea para Word
+            processed_cells = [c.replace('<br>', '\n').replace('<br/>', '\n').replace('**', '').strip() for c in cells]
+                
             if not in_table:
                 in_table = True
-                table = document.add_table(rows=1, cols=len(cells))
-                # Intentamos aplicar el estilo, si la plantilla no lo trae, ignoramos
-                try:
-                    table.style = 'Table Grid'
-                except:
-                    pass
+                table = document.add_table(rows=1, cols=len(processed_cells))
+                try: table.style = 'Table Grid'
+                except: pass
                 row_cells = table.rows[0].cells
-                for i, c in enumerate(cells):
-                    if i < len(row_cells): row_cells[i].text = c.replace('**', '')
+                for i, c in enumerate(processed_cells):
+                    if i < len(row_cells): row_cells[i].text = c
             else:
                 row_cells = table.add_row().cells
-                for i, c in enumerate(cells):
-                    if i < len(row_cells): row_cells[i].text = c.replace('**', '')
+                for i, c in enumerate(processed_cells):
+                    if i < len(row_cells): row_cells[i].text = c
         else:
             in_table = False
-            if line.startswith('## '):
-                document.add_heading(line.lstrip('## '), level=2)
-            elif line.startswith('# '):
-                document.add_heading(line.lstrip('# '), level=1)
-            elif not line.strip():
+            if line_stripped.startswith('## '):
+                document.add_heading(line_stripped.lstrip('## '), level=2)
+            elif line_stripped.startswith('# '):
+                document.add_heading(line_stripped.lstrip('# '), level=1)
+            elif not line_stripped:
                 document.add_paragraph('')
             else:
                 p = document.add_paragraph()
-                parts = re.split(r'(\*\*.*?\*\*)', line)
+                parts = re.split(r'(\*\*.*?\*\*)', line_stripped)
                 for part in parts:
                     if part.startswith('**') and part.endswith('**'):
                         p.add_run(part.strip('*')).bold = True
@@ -671,7 +704,7 @@ async def download_analysis(
     instructions: str = Form("Exportación de Análisis PIDA"),
     history_json: str = Form(""),
     file_format: str = Form("docx"),
-    analysis_id: Optional[str] = Form(None), # CORRECCIÓN: Agregado para que no de error 422 si el frontend lo envía
+    analysis_id: Optional[str] = Form(None),
     current_user: Dict[str, Any] = Depends(get_current_user)
 ):
     plan = await get_user_plan_unified(current_user)
