@@ -227,28 +227,43 @@ def sanitize_text_for_pdf(text: str) -> str:
         text = text.replace(char, replacement)
     return text.encode('latin1', 'replace').decode('latin-1')
 
-# --- NUEVA FUNCIÓN PARA TABLAS ROBUSTAS EN PDF ---
+# --- CÁLCULO MATEMÁTICO EXACTO DE ALTURA PARA FPDF ---
+def get_multi_cell_height(pdf, w, text):
+    text = str(text)
+    lines = 0
+    for paragraph in text.split('\n'):
+        words = paragraph.split(' ')
+        if not words or (len(words) == 1 and words[0] == ''):
+            lines += 1
+            continue
+        current_line = ""
+        for word in words:
+            if pdf.get_string_width(current_line + word + " ") > w and current_line:
+                lines += 1
+                current_line = word + " "
+            else:
+                current_line += word + " "
+        lines += 1
+    return lines * 6
+
 def render_table_row_fpdf(pdf, cells):
     ancho_efectivo = pdf.w - pdf.l_margin - pdf.r_margin
-    col_width = ancho_efectivo / len(cells)
+    col_width = ancho_efectivo / max(len(cells), 1)
     line_height = 6
     
-    # Procesar <br> generados por LLMs a verdaderos saltos de línea y quitar negritas para evitar fallos
+    # Manejar los <br> y limpiar negritas
     processed_cells = [c.replace('<br>', '\n').replace('<br/>', '\n').replace('**', '').strip() for c in cells]
     
-    # Determinar la altura máxima de la fila en base a la celda con más texto
-    max_lines = 1
+    # Determinar qué celda es la más alta para expandir la fila
+    max_height = 0
     for cell in processed_cells:
-        lines_in_cell = 0
-        for paragraph in cell.split('\n'):
-            chars_per_line = max(1, int(col_width / 2.2)) # Estimación para Arial 10
-            lines_in_cell += max(1, len(paragraph) // chars_per_line + 1)
-        if lines_in_cell > max_lines:
-            max_lines = lines_in_cell
+        h = get_multi_cell_height(pdf, col_width, cell)
+        if h > max_height:
+            max_height = h
             
-    row_height = max_lines * line_height
+    row_height = max_height if max_height > 0 else line_height
     
-    # Salto de página si no cabe
+    # Salto de página si la fila ya no cabe
     if pdf.get_y() + row_height > pdf.page_break_trigger:
         pdf.add_page()
         
@@ -259,37 +274,46 @@ def render_table_row_fpdf(pdf, cells):
         x_before = pdf.get_x()
         y_before = pdf.get_y()
         
-        # 1. Dibujamos el recuadro completo
+        # 1. Dibujamos el recuadro con la altura máxima
         pdf.rect(x_before, y_before, col_width, row_height)
-        # 2. Imprimimos el texto adentro (multi_cell gestiona internamente los \n)
+        # 2. Imprimimos el texto (multi_cell gestiona los \n internamente)
         pdf.multi_cell(col_width, line_height, cell, border=0, align='L')
         
         # 3. Nos movemos a la siguiente columna sin bajar de fila
         pdf.set_xy(x_before + col_width, start_y)
         
-    # Al final, bajamos el cursor toda la altura calculada
+    # Al terminar la fila, bajamos el cursor
     pdf.set_xy(pdf.l_margin, start_y + row_height)
 
 def write_markdown_to_pdf(pdf, text):
     pdf.set_font("Arial", "", 10)
+    lines = text.strip().split('\n')
+    i = 0
     
-    for line in text.split('\n'):
-        line_stripped = line.strip()
+    while i < len(lines):
+        line_stripped = lines[i].strip()
+        
+        # DETECTAR BLOQUE DE TABLA ENTERO
+        if line_stripped.startswith('|') and line_stripped.endswith('|'):
+            table_lines = []
+            while i < len(lines) and lines[i].strip().startswith('|') and lines[i].strip().endswith('|'):
+                table_lines.append(lines[i].strip())
+                i += 1
+                
+            for r_idx, t_line in enumerate(table_lines):
+                cells = [c.strip() for c in t_line.split('|')[1:-1]]
+                if all(re.match(r'^:?-+:?$', c) for c in cells):
+                    continue # Saltar la fila separadora de Markdown
+                if len(cells) > 0:
+                    pdf.set_font("Arial", "B", 10) if r_idx == 0 else pdf.set_font("Arial", "", 10)
+                    render_table_row_fpdf(pdf, cells)
+            pdf.ln(5)
+            pdf.set_font("Arial", "", 10)
+            continue
+            
         if not line_stripped:
             pdf.ln(5)
-            continue
-        
-        # DETECTAR Y DIBUJAR TABLAS EN PDF
-        if line_stripped.startswith('|') and line_stripped.endswith('|'):
-            cells = [c.strip() for c in line_stripped.split('|')[1:-1]]
-            if all(re.match(r'^:?-+:?$', c) for c in cells):
-                continue # Saltar la fila separadora de Markdown
-            
-            if len(cells) > 0:
-                render_table_row_fpdf(pdf, cells)
-            continue
-            
-        if line_stripped.startswith('## '):
+        elif line_stripped.startswith('## '):
             pdf.ln(3)
             pdf.set_font("Arial", "B", 12)
             pdf.set_text_color(29, 53, 87)
@@ -303,7 +327,6 @@ def write_markdown_to_pdf(pdf, text):
             pdf.multi_cell(0, 10, line_stripped.replace('# ', ''))
             pdf.set_text_color(0, 0, 0)
             pdf.set_font("Arial", "", 10)
-            
         elif line_stripped.startswith('* ') or line_stripped.startswith('- '):
             pdf.set_x(15)
             clean_line = line_stripped[2:]
@@ -327,51 +350,60 @@ def write_markdown_to_pdf(pdf, text):
                 else:
                     pdf.write(6, part)
             pdf.ln(6)
+        i += 1
 
 def parse_and_add_markdown_to_docx(document, markdown_text):
-    in_table = False
-    table = None
-    
-    for line in markdown_text.strip().split('\n'):
-        line_stripped = line.strip()
+    lines = markdown_text.strip().split('\n')
+    i = 0
+    while i < len(lines):
+        line_stripped = lines[i].strip()
         
-        # DETECTAR Y DIBUJAR TABLAS EN DOCX
+        # DETECTAR Y AISLAR BLOQUE DE TABLAS
         if line_stripped.startswith('|') and line_stripped.endswith('|'):
-            cells = [c.strip() for c in line_stripped.split('|')[1:-1]]
-            if all(re.match(r'^:?-+:?$', c) for c in cells):
-                continue
-                
-            # Procesar <br> a verdaderos saltos de línea para Word
-            processed_cells = [c.replace('<br>', '\n').replace('<br/>', '\n').replace('**', '').strip() for c in cells]
-                
-            if not in_table:
-                in_table = True
-                table = document.add_table(rows=1, cols=len(processed_cells))
+            table_lines = []
+            while i < len(lines) and lines[i].strip().startswith('|') and lines[i].strip().endswith('|'):
+                table_lines.append(lines[i].strip())
+                i += 1
+            
+            if len(table_lines) > 0:
+                headers = [c.strip() for c in table_lines[0].split('|')[1:-1]]
+                table = document.add_table(rows=1, cols=len(headers))
                 try: table.style = 'Table Grid'
                 except: pass
-                row_cells = table.rows[0].cells
-                for i, c in enumerate(processed_cells):
-                    if i < len(row_cells): row_cells[i].text = c
-            else:
-                row_cells = table.add_row().cells
-                for i, c in enumerate(processed_cells):
-                    if i < len(row_cells): row_cells[i].text = c
+                
+                # Rellenar la primera fila
+                for col_idx, header in enumerate(headers):
+                    if col_idx < len(table.rows[0].cells):
+                        table.rows[0].cells[col_idx].text = header.replace('**', '').replace('<br>', '\n').replace('<br/>', '\n')
+                
+                # Rellenar las demás
+                start_idx = 1
+                if len(table_lines) > 1 and all(re.match(r'^:?-+:?$', c.strip()) for c in table_lines[1].split('|')[1:-1]):
+                    start_idx = 2
+                    
+                for r_idx in range(start_idx, len(table_lines)):
+                    row_cells_text = [c.strip() for c in table_lines[r_idx].split('|')[1:-1]]
+                    row = table.add_row()
+                    for col_idx, cell_text in enumerate(row_cells_text):
+                        if col_idx < len(row.cells):
+                            row.cells[col_idx].text = cell_text.replace('**', '').replace('<br>', '\n').replace('<br/>', '\n')
+            continue
+            
+        if line_stripped.startswith('## '):
+            document.add_heading(line_stripped.lstrip('## '), level=2)
+        elif line_stripped.startswith('# '):
+            document.add_heading(line_stripped.lstrip('# '), level=1)
+        elif not line_stripped:
+            document.add_paragraph('')
         else:
-            in_table = False
-            if line_stripped.startswith('## '):
-                document.add_heading(line_stripped.lstrip('## '), level=2)
-            elif line_stripped.startswith('# '):
-                document.add_heading(line_stripped.lstrip('# '), level=1)
-            elif not line_stripped:
-                document.add_paragraph('')
-            else:
-                p = document.add_paragraph()
-                parts = re.split(r'(\*\*.*?\*\*)', line_stripped)
-                for part in parts:
-                    if part.startswith('**') and part.endswith('**'):
-                        p.add_run(part.strip('*')).bold = True
-                    else:
-                        p.add_run(part)
+            p = document.add_paragraph()
+            parts = re.split(r'(\*\*.*?\*\*)', line_stripped)
+            for part in parts:
+                if part.startswith('**') and part.endswith('**'):
+                    p.add_run(part.strip('*')).bold = True
+                else:
+                    p.add_run(part)
+        i += 1
 
 class PDF(FPDF):
     def header(self):
@@ -450,7 +482,6 @@ def create_pdf_sync(analysis_text: str, instructions: str) -> tuple[bytes, str, 
         err.multi_cell(0, 10, f"Error: {str(e)}")
         return err.output(dest='S').encode('latin-1'), "application/pdf", "Error.pdf"
 
-
 async def stream_analysis_generator(model, model_parts, gen_config, safety_settings, current_user, instructions, original_filenames, analysis_id, history_json):
     full_text = ""
     try:
@@ -508,7 +539,6 @@ async def stream_analysis_generator(model, model_parts, gen_config, safety_setti
         print(f"Error stream: {e}")
         yield f"data: {json.dumps({'error': str(e)})}\n\n"
 
-
 @app.post("/compress-and-upload")
 async def compress_and_upload(
     file: UploadFile = File(...),
@@ -559,7 +589,6 @@ async def compress_and_upload(
         print(f"Error comprimiendo el archivo {file.filename}: {e}")
         raise HTTPException(status_code=500, detail=f"Error optimizando el documento: {str(e)}")
 
-
 @app.post("/generate-upload-urls")
 async def generate_upload_urls(
     payload: Dict[str, Any] = Body(...),
@@ -600,7 +629,6 @@ async def generate_upload_urls(
             raise HTTPException(500, f"Error generando URL segura. Verifica IAM: {e}")
             
     return {"urls": urls_response}
-
 
 @app.post("/analyze")
 async def analyze_documents(
