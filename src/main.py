@@ -25,7 +25,7 @@ from google.genai import types
 from google.genai.errors import APIError
 
 from src.core.security import get_current_user
-from src.core.prompts import ANALYZER_SYSTEM_PROMPT
+from src.core.prompts import ANALYZER_SYSTEM_PROMPT, FIRST_TURN_PROMPT_TEMPLATE, FOLLOW_UP_PROMPT_TEMPLATE
 
 # Cargar variables
 load_dotenv()
@@ -534,7 +534,10 @@ async def analyze_documents(
     
     if not is_follow_up:
         db_history.append({"role": "user", "content": instructions})
-        user_parts = model_parts + [types.Part.from_text(text=f"\nINSTRUCCIONES DEL USUARIO:\n{instructions}")]
+        
+        # Usamos el prompt centralizado de primer turno
+        first_turn_prompt = FIRST_TURN_PROMPT_TEMPLATE.format(instructions=instructions)
+        user_parts = model_parts + [types.Part.from_text(text=first_turn_prompt)]
         contents.append(types.Content(role="user", parts=user_parts))
     else:
         for i, msg in enumerate(db_history):
@@ -546,6 +549,11 @@ async def analyze_documents(
                 contents.append(types.Content(role=role, parts=model_parts + [text_part]))
             else:
                 contents.append(types.Content(role=role, parts=[text_part]))
+                
+        # Agregar nueva pregunta con la directriz centralizada
+        db_history.append({"role": "user", "content": instructions})
+        follow_up_prompt = FOLLOW_UP_PROMPT_TEMPLATE.format(instructions=instructions)
+        contents.append(types.Content(role="user", parts=[types.Part.from_text(text=follow_up_prompt)]))
                 
         # Agregar nueva pregunta con directriz
         db_history.append({"role": "user", "content": instructions})
