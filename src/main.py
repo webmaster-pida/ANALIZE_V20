@@ -562,7 +562,8 @@ async def analyze_documents(
             else:
                 contents.append(types.Content(role=role, parts=[text_part]))
                 
-        # Agregar nueva pregunta con la directriz centralizada
+        # IMPORTANTE: Usamos la plantilla centralizada para que SIEMPRE lleve las reglas del JSON
+        # Y NO duplicamos db_history.append aquí (ya se hace en el stream_generator)
         follow_up_prompt = FOLLOW_UP_PROMPT_TEMPLATE.format(instructions=instructions)
         contents.append(types.Content(role="user", parts=[types.Part.from_text(text=follow_up_prompt)]))
 
