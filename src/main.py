@@ -18,6 +18,10 @@ from google.cloud.firestore import AsyncClient, SERVER_TIMESTAMP, Query
 from google.cloud import firestore 
 from google.cloud import storage 
 import google.auth
+import zlib
+import base64
+import urllib.request
+from docx.shared import Inches
 
 # --- NUEVOS IMPORTS DEL SDK GENAI ---
 from google import genai
@@ -325,23 +329,79 @@ def download_and_parse_docx(gs_uri: str) -> str:
         print(f"Error procesando DOCX: {e}")
         return ""
 
+def get_mermaid_image_bytes(mermaid_code: str) -> bytes:
+    try:
+        # Kroki requiere que el código se comprima y se convierta a base64 seguro para URL
+        compressed = zlib.compress(mermaid_code.encode('utf-8'), 9)
+        b64 = base64.urlsafe_b64encode(compressed).decode('ascii')
+        url = f"https://kroki.io/mermaid/png/{b64}"
+        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+        with urllib.request.urlopen(req) as response:
+            return response.read()
+    except Exception as e:
+        print(f"Error fetching kroki image: {e}")
+        return None
+
 def create_docx_sync(analysis_text: str, instructions: str) -> tuple[bytes, str, str]:
     stream = io.BytesIO()
     doc = Document()
-    doc.add_heading("PIDA-AI: Resumen", 0); doc.add_paragraph(f"Fecha: {datetime.now().strftime('%d/%m/%Y')}")
-    doc.add_heading("Instrucciones", 2); doc.add_paragraph(instructions)
-    doc.add_heading("Analisis", 2); parse_and_add_markdown_to_docx(doc, analysis_text)
+    doc.add_heading("PIDA-AI: Resumen", 0)
+    doc.add_paragraph(f"Fecha: {datetime.now().strftime('%d/%m/%Y')}")
+    doc.add_heading("Instrucciones", 2)
+    doc.add_paragraph(instructions)
+    doc.add_heading("Analisis", 2)
+    
+    # Interceptar bloques de Mermaid para inyectar imágenes
+    parts = re.split(r'```mermaid\n(.*?)\n```', analysis_text, flags=re.DOTALL)
+    for i, part in enumerate(parts):
+        if i % 2 == 0:  # Es texto normal
+            if part.strip():
+                parse_and_add_markdown_to_docx(doc, part)
+        else:  # Es código de Mermaid
+            img_bytes = get_mermaid_image_bytes(part.strip())
+            if img_bytes:
+                image_stream = io.BytesIO(img_bytes)
+                doc.add_picture(image_stream, width=Inches(6.0)) # Ajustar al ancho de la página
+            else:
+                doc.add_paragraph("[Error al generar la imagen del diagrama]")
+
     doc.save(stream); stream.seek(0)
     return stream.read(), "application/vnd.openxmlformats-officedocument.wordprocessingml.document", generate_filename(instructions, "docx")
 
 def create_pdf_sync(analysis_text: str, instructions: str) -> tuple[bytes, str, str]:
-    safe_inst, safe_ana = sanitize_text_for_pdf(instructions), sanitize_text_for_pdf(analysis_text)
-    pdf = PDF(); pdf.alias_nb_pages(); pdf.add_page()
-    pdf.set_font("Arial", "B", 12); pdf.cell(0, 10, "Instrucciones", 0, 1); pdf.set_font("Arial", "", 11); pdf.multi_cell(0, 6, safe_inst); pdf.ln(5)
+    safe_inst = sanitize_text_for_pdf(instructions)
+    pdf = PDF()
+    pdf.alias_nb_pages(); pdf.add_page()
+    pdf.set_font("Arial", "B", 12); pdf.cell(0, 10, "Instrucciones", 0, 1)
+    pdf.set_font("Arial", "", 11); pdf.multi_cell(0, 6, safe_inst); pdf.ln(5)
     pdf.set_font("Arial", "B", 12); pdf.cell(0, 10, "Analisis", 0, 1)
-    if not safe_ana.strip():
+    
+    if not analysis_text.strip():
         pdf.set_font("Arial", "I", 11); pdf.multi_cell(0, 6, "[Sin contenido]")
-    else: write_markdown_to_pdf(pdf, safe_ana)
+    else:
+        # Interceptar bloques de Mermaid para inyectar imágenes
+        parts = re.split(r'```mermaid\n(.*?)\n```', analysis_text, flags=re.DOTALL)
+        for i, part in enumerate(parts):
+            if i % 2 == 0: # Es texto normal
+                safe_part = sanitize_text_for_pdf(part)
+                if safe_part.strip():
+                    write_markdown_to_pdf(pdf, safe_part)
+            else: # Es código de Mermaid
+                img_bytes = get_mermaid_image_bytes(part.strip())
+                if img_bytes:
+                    import tempfile
+                    with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as tmp:
+                        tmp.write(img_bytes)
+                        tmp_path = tmp.name
+                    pdf.ln(5)
+                    # Insertar la imagen escalada al ancho de la página
+                    pdf.image(tmp_path, w=pdf.w - pdf.l_margin - pdf.r_margin)
+                    pdf.ln(5)
+                    os.remove(tmp_path)
+                else:
+                    pdf.set_font("Arial", "I", 10)
+                    pdf.multi_cell(0, 6, "[Error al generar la imagen del diagrama]")
+
     try:
         pdf_string = pdf.output(dest='S')
         pdf_bytes = pdf_string.encode('latin-1', 'replace') if isinstance(pdf_string, str) else pdf_string
