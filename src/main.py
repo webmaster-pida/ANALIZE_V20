@@ -22,6 +22,7 @@ import zlib
 import base64
 import urllib.request
 from docx.shared import Inches
+import struct
 
 # --- NUEVOS IMPORTS DEL SDK GENAI ---
 from google import genai
@@ -245,6 +246,9 @@ def write_markdown_to_pdf(pdf, text):
             pdf.ln(5); pdf.set_font("Arial", "", 10); continue
             
         if not line: pdf.ln(5)
+        elif line.startswith('### '):
+            pdf.ln(4); pdf.set_font("Arial", "B", 11); pdf.set_text_color(0, 51, 102)
+            pdf.multi_cell(0, 7, line.replace('### ', '')); pdf.set_text_color(0, 0, 0); pdf.set_font("Arial", "", 10)
         elif line.startswith('## '):
             pdf.ln(3); pdf.set_font("Arial", "B", 12); pdf.set_text_color(29, 53, 87)
             pdf.multi_cell(0, 8, line.replace('## ', '')); pdf.set_text_color(0, 0, 0); pdf.set_font("Arial", "", 10)
@@ -293,7 +297,8 @@ def parse_and_add_markdown_to_docx(document, markdown_text):
                             row.cells[col_idx].text = cell_text.replace('**', '').replace('<br>', '\n').replace('<br/>', '\n')
             continue
             
-        if line.startswith('## '): document.add_heading(line.lstrip('## '), level=2)
+        if line.startswith('### '): document.add_heading(line.lstrip('### '), level=3)
+        elif line.startswith('## '): document.add_heading(line.lstrip('## '), level=2)
         elif line.startswith('# '): document.add_heading(line.lstrip('# '), level=1)
         elif not line: document.add_paragraph('')
         else:
@@ -342,6 +347,16 @@ def get_mermaid_image_bytes(mermaid_code: str) -> bytes:
         print(f"Error fetching kroki image: {e}")
         return None
 
+def get_png_dimensions(data: bytes):
+    # Lee el ancho y alto real del PNG para escalar inteligentemente en el PDF
+    try:
+        if data.startswith(b'\x89PNG\r\n\x1a\n'):
+            w, h = struct.unpack('>LL', data[16:24])
+            return w, h
+    except Exception:
+        pass
+    return None, None
+
 def create_docx_sync(analysis_text: str, instructions: str) -> tuple[bytes, str, str]:
     stream = io.BytesIO()
     doc = Document()
@@ -369,23 +384,20 @@ def create_docx_sync(analysis_text: str, instructions: str) -> tuple[bytes, str,
     return stream.read(), "application/vnd.openxmlformats-officedocument.wordprocessingml.document", generate_filename(instructions, "docx")
 
 def create_pdf_sync(analysis_text: str, instructions: str) -> tuple[bytes, str, str]:
-    safe_inst = sanitize_text_for_pdf(instructions)
-    pdf = PDF()
-    pdf.alias_nb_pages(); pdf.add_page()
-    pdf.set_font("Arial", "B", 12); pdf.cell(0, 10, "Instrucciones", 0, 1)
-    pdf.set_font("Arial", "", 11); pdf.multi_cell(0, 6, safe_inst); pdf.ln(5)
+    safe_inst, safe_ana = sanitize_text_for_pdf(instructions), sanitize_text_for_pdf(analysis_text)
+    pdf = PDF(); pdf.alias_nb_pages(); pdf.add_page()
+    pdf.set_font("Arial", "B", 12); pdf.cell(0, 10, "Instrucciones", 0, 1); pdf.set_font("Arial", "", 11); pdf.multi_cell(0, 6, safe_inst); pdf.ln(5)
     pdf.set_font("Arial", "B", 12); pdf.cell(0, 10, "Analisis", 0, 1)
     
-    if not analysis_text.strip():
+    if not safe_ana.strip():
         pdf.set_font("Arial", "I", 11); pdf.multi_cell(0, 6, "[Sin contenido]")
     else:
         # Interceptar bloques de Mermaid para inyectar imágenes
-        parts = re.split(r'```mermaid\n(.*?)\n```', analysis_text, flags=re.DOTALL)
+        parts = re.split(r'```mermaid\n(.*?)\n```', safe_ana, flags=re.DOTALL)
         for i, part in enumerate(parts):
             if i % 2 == 0: # Es texto normal
-                safe_part = sanitize_text_for_pdf(part)
-                if safe_part.strip():
-                    write_markdown_to_pdf(pdf, safe_part)
+                if part.strip():
+                    write_markdown_to_pdf(pdf, part)
             else: # Es código de Mermaid
                 img_bytes = get_mermaid_image_bytes(part.strip())
                 if img_bytes:
@@ -393,9 +405,33 @@ def create_pdf_sync(analysis_text: str, instructions: str) -> tuple[bytes, str, 
                     with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as tmp:
                         tmp.write(img_bytes)
                         tmp_path = tmp.name
+                    
                     pdf.ln(5)
-                    # Insertar la imagen escalada al ancho de la página
-                    pdf.image(tmp_path, w=pdf.w - pdf.l_margin - pdf.r_margin)
+                    
+                    # --- MAGIA DE ESCALADO INTELIGENTE ---
+                    w_px, h_px = get_png_dimensions(img_bytes)
+                    max_w = pdf.w - pdf.l_margin - pdf.r_margin
+                    max_h = pdf.h - pdf.t_margin - pdf.b_margin - 15 # 15mm de margen de seguridad inferior
+                    
+                    target_w = max_w
+                    target_h = 0
+                    x_pos = pdf.l_margin
+                    
+                    if w_px and h_px:
+                        ratio = h_px / w_px
+                        calc_h = max_w * ratio
+                        
+                        # Si la imagen no cabe en el espacio que sobra de la página actual, forzamos un salto
+                        if calc_h > (pdf.page_break_trigger - pdf.get_y()):
+                            pdf.add_page()
+                            
+                        # Si la imagen es más alta que la página ENTERA, la encogemos y la centramos
+                        if calc_h > max_h:
+                            target_h = max_h
+                            target_w = max_h / ratio
+                            x_pos = pdf.l_margin + (max_w - target_w) / 2 # Centrar horizontalmente
+                            
+                    pdf.image(tmp_path, x=x_pos, w=target_w, h=target_h)
                     pdf.ln(5)
                     os.remove(tmp_path)
                 else:
@@ -410,7 +446,6 @@ def create_pdf_sync(analysis_text: str, instructions: str) -> tuple[bytes, str, 
     except Exception as e:
         err = FPDF(); err.add_page(); err.multi_cell(0, 10, f"Error: {str(e)}")
         return err.output(dest='S').encode('latin-1'), "application/pdf", "Error.pdf"
-
 # --- CORE GENAI STREAMING GENERATOR ---
 async def stream_analysis_generator(genai_client, model_name, contents, gen_config, current_user, instructions, original_filenames, files_info, analysis_id, db_history):
     full_text = ""
