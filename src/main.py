@@ -18,11 +18,6 @@ from google.cloud.firestore import AsyncClient, SERVER_TIMESTAMP, Query
 from google.cloud import firestore 
 from google.cloud import storage 
 import google.auth
-import zlib
-import base64
-import urllib.request
-from docx.shared import Inches
-import struct
 
 # --- NUEVOS IMPORTS DEL SDK GENAI ---
 from google import genai
@@ -334,29 +329,6 @@ def download_and_parse_docx(gs_uri: str) -> str:
         print(f"Error procesando DOCX: {e}")
         return ""
 
-def get_mermaid_image_bytes(mermaid_code: str) -> bytes:
-    try:
-        # Kroki requiere que el código se comprima y se convierta a base64 seguro para URL
-        compressed = zlib.compress(mermaid_code.encode('utf-8'), 9)
-        b64 = base64.urlsafe_b64encode(compressed).decode('ascii')
-        url = f"https://kroki.io/mermaid/png/{b64}"
-        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-        with urllib.request.urlopen(req) as response:
-            return response.read()
-    except Exception as e:
-        print(f"Error fetching kroki image: {e}")
-        return None
-
-def get_png_dimensions(data: bytes):
-    # Lee el ancho y alto real del PNG para escalar inteligentemente en el PDF
-    try:
-        if data.startswith(b'\x89PNG\r\n\x1a\n'):
-            w, h = struct.unpack('>LL', data[16:24])
-            return w, h
-    except Exception:
-        pass
-    return None, None
-
 def create_docx_sync(analysis_text: str, instructions: str) -> tuple[bytes, str, str]:
     stream = io.BytesIO()
     doc = Document()
@@ -366,19 +338,7 @@ def create_docx_sync(analysis_text: str, instructions: str) -> tuple[bytes, str,
     doc.add_paragraph(instructions)
     doc.add_heading("Analisis", 2)
     
-    # Interceptar bloques de Mermaid para inyectar imágenes
-    parts = re.split(r'```mermaid\n(.*?)\n```', analysis_text, flags=re.DOTALL)
-    for i, part in enumerate(parts):
-        if i % 2 == 0:  # Es texto normal
-            if part.strip():
-                parse_and_add_markdown_to_docx(doc, part)
-        else:  # Es código de Mermaid
-            img_bytes = get_mermaid_image_bytes(part.strip())
-            if img_bytes:
-                image_stream = io.BytesIO(img_bytes)
-                doc.add_picture(image_stream, width=Inches(6.0)) # Ajustar al ancho de la página
-            else:
-                doc.add_paragraph("[Error al generar la imagen del diagrama]")
+    parse_and_add_markdown_to_docx(doc, analysis_text)
 
     doc.save(stream); stream.seek(0)
     return stream.read(), "application/vnd.openxmlformats-officedocument.wordprocessingml.document", generate_filename(instructions, "docx")
@@ -392,51 +352,7 @@ def create_pdf_sync(analysis_text: str, instructions: str) -> tuple[bytes, str, 
     if not safe_ana.strip():
         pdf.set_font("Arial", "I", 11); pdf.multi_cell(0, 6, "[Sin contenido]")
     else:
-        # Interceptar bloques de Mermaid para inyectar imágenes
-        parts = re.split(r'```mermaid\n(.*?)\n```', safe_ana, flags=re.DOTALL)
-        for i, part in enumerate(parts):
-            if i % 2 == 0: # Es texto normal
-                if part.strip():
-                    write_markdown_to_pdf(pdf, part)
-            else: # Es código de Mermaid
-                img_bytes = get_mermaid_image_bytes(part.strip())
-                if img_bytes:
-                    import tempfile
-                    with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as tmp:
-                        tmp.write(img_bytes)
-                        tmp_path = tmp.name
-                    
-                    pdf.ln(5)
-                    
-                    # --- MAGIA DE ESCALADO INTELIGENTE ---
-                    w_px, h_px = get_png_dimensions(img_bytes)
-                    max_w = pdf.w - pdf.l_margin - pdf.r_margin
-                    max_h = pdf.h - pdf.t_margin - pdf.b_margin - 15 # 15mm de margen de seguridad inferior
-                    
-                    target_w = max_w
-                    target_h = 0
-                    x_pos = pdf.l_margin
-                    
-                    if w_px and h_px:
-                        ratio = h_px / w_px
-                        calc_h = max_w * ratio
-                        
-                        # Si la imagen no cabe en el espacio que sobra de la página actual, forzamos un salto
-                        if calc_h > (pdf.page_break_trigger - pdf.get_y()):
-                            pdf.add_page()
-                            
-                        # Si la imagen es más alta que la página ENTERA, la encogemos y la centramos
-                        if calc_h > max_h:
-                            target_h = max_h
-                            target_w = max_h / ratio
-                            x_pos = pdf.l_margin + (max_w - target_w) / 2 # Centrar horizontalmente
-                            
-                    pdf.image(tmp_path, x=x_pos, w=target_w, h=target_h)
-                    pdf.ln(5)
-                    os.remove(tmp_path)
-                else:
-                    pdf.set_font("Arial", "I", 10)
-                    pdf.multi_cell(0, 6, "[Error al generar la imagen del diagrama]")
+        write_markdown_to_pdf(pdf, safe_ana)
 
     try:
         pdf_string = pdf.output(dest='S')
@@ -446,6 +362,7 @@ def create_pdf_sync(analysis_text: str, instructions: str) -> tuple[bytes, str, 
     except Exception as e:
         err = FPDF(); err.add_page(); err.multi_cell(0, 10, f"Error: {str(e)}")
         return err.output(dest='S').encode('latin-1'), "application/pdf", "Error.pdf"
+
 # --- CORE GENAI STREAMING GENERATOR ---
 async def stream_analysis_generator(genai_client, model_name, contents, gen_config, current_user, instructions, original_filenames, files_info, analysis_id, db_history):
     full_text = ""
