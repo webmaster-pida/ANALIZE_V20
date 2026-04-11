@@ -549,7 +549,7 @@ async def analyze_documents(
                 
         # Agregar nueva pregunta con directriz
         db_history.append({"role": "user", "content": instructions})
-        follow_up_prompt = f"[NUEVA PREGUNTA]\n{instructions}\n\n[SISTEMA]: Responde EXCLUSIVAMENTE a esta pregunta basada en los documentos analizados. NO repitas el análisis inicial. Termina siempre con ---PREGUNTAS--- sugiriendo 3 opciones."
+        follow_up_prompt = f"[NUEVA PREGUNTA]\n{instructions}\n\n[SISTEMA]: Responde EXCLUSIVAMENTE a esta pregunta basada en los documentos analizados. NO repitas el análisis inicial. ESTRICTAMENTE termina tu respuesta con el título '### Preguntas de Seguimiento' seguido únicamente de 3 viñetas con preguntas en español."
         contents.append(types.Content(role="user", parts=[types.Part.from_text(text=follow_up_prompt)]))
 
     gen_config = types.GenerateContentConfig(
