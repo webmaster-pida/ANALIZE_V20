@@ -352,13 +352,13 @@ def create_pdf_sync(analysis_text: str, instructions: str) -> tuple[bytes, str, 
         return err.output(dest='S').encode('latin-1'), "application/pdf", "Error.pdf"
 
 # --- CORE GENAI STREAMING GENERATOR ---
-async def stream_analysis_generator(genai_client, model_name, model_parts, gen_config, current_user, instructions, original_filenames, analysis_id, history_json):
+async def stream_analysis_generator(genai_client, model_name, contents, gen_config, current_user, instructions, original_filenames, files_info, analysis_id, db_history):
     full_text = ""
     try:
-        # Llamada Asíncrona con el nuevo SDK
+        # Llamada Asíncrona con el SDK construida con soporte de chat/historial
         responses = await genai_client.aio.models.generate_content_stream(
             model=model_name,
-            contents=model_parts,
+            contents=contents,
             config=gen_config
         )
         
@@ -367,31 +367,34 @@ async def stream_analysis_generator(genai_client, model_name, model_parts, gen_c
                 full_text += chunk.text
                 yield f"data: {json.dumps({'text': chunk.text})}\n\n"
         
-        # Lógica de guardado en Firestore (sin cambios)
         user_id = current_user.get("uid")
-        final_history = []
-        if history_json:
-            try: final_history = json.loads(history_json)
-            except: pass
         
-        final_history.append({"role": "model", "content": full_text})
+        # Registrar respuesta del modelo
+        db_history.append({"role": "model", "content": full_text})
         final_id = analysis_id
         
         if final_id:
             doc_ref = db.collection("analysis_history").document(final_id)
             doc = await doc_ref.get()
             if doc.exists:
-                await doc_ref.update({"analysis": json.dumps(final_history), "timestamp": SERVER_TIMESTAMP})
+                await doc_ref.update({
+                    "analysis": json.dumps(db_history), 
+                    "timestamp": SERVER_TIMESTAMP
+                })
             else: final_id = "" 
                 
         if not final_id:
-            title_source = final_history[0].get("content", instructions) if (final_history and len(final_history) > 0 and final_history[0].get("role") == "user") else instructions
+            title_source = db_history[0].get("content", instructions) if db_history else instructions
             title = (title_source[:40] + '...') if len(title_source) > 40 else title_source
             doc_ref = db.collection("analysis_history").document()
             await doc_ref.set({
-                "userId": user_id, "title": title, "instructions": title_source,
-                "analysis": json.dumps(final_history) if final_history else full_text, 
-                "timestamp": SERVER_TIMESTAMP, "original_filenames": original_filenames
+                "userId": user_id, 
+                "title": title, 
+                "instructions": title_source,
+                "analysis": json.dumps(db_history), 
+                "timestamp": SERVER_TIMESTAMP, 
+                "original_filenames": original_filenames,
+                "files_data": files_info # <- Blindaje: Se almacena metadata de archivos en Backend
             })
             final_id = doc_ref.id
         
@@ -461,8 +464,8 @@ async def generate_upload_urls(payload: Dict[str, Any] = Body(...), current_user
 
 @app.post("/analyze")
 async def analyze_documents(
-    files_data: str = Form(...), instructions: str = Form(...), analysis_id: str = Form(""),
-    history_json: str = Form(""), current_user: Dict[str, Any] = Depends(get_current_user)
+    files_data: str = Form("[]"), instructions: str = Form(...), analysis_id: str = Form(""),
+    current_user: Dict[str, Any] = Depends(get_current_user)
 ):
     if not genai_client: raise HTTPException(500, "El cliente de IA no está inicializado.")
     
@@ -470,17 +473,40 @@ async def analyze_documents(
     plan = await get_user_plan_unified(current_user)
     if plan == 'none': raise HTTPException(403, "No tienes un plan activo.")
 
-    try: files_info = json.loads(files_data)
-    except: raise HTTPException(400, "Formato de metadatos inválido.")
+    # 1. Recuperar Estado (Historial y Archivos) desde Firestore
+    db_history = []
+    original_filenames = []
+    files_info = []
+    is_follow_up = False
 
-    if DOCS_LIMITS.get(plan, 0) != -1 and len(files_info) > DOCS_LIMITS.get(plan, 0): raise HTTPException(403, f"Plan excede límite de documentos.")
+    if analysis_id:
+        doc_ref = db.collection("analysis_history").document(analysis_id)
+        doc = await doc_ref.get()
+        if doc.exists:
+            doc_data = doc.to_dict()
+            if doc_data.get("userId") != user_id:
+                raise HTTPException(403, "No tienes permiso para acceder a este historial.")
+            
+            db_history = json.loads(doc_data.get("analysis", "[]"))
+            files_info = doc_data.get("files_data", [])
+            original_filenames = doc_data.get("original_filenames", [])
+            is_follow_up = True
+        else:
+            analysis_id = "" 
+
+    if not is_follow_up:
+        try: files_info = json.loads(files_data)
+        except: raise HTTPException(400, "Formato de metadatos inválido.")
+        if DOCS_LIMITS.get(plan, 0) != -1 and len(files_info) > DOCS_LIMITS.get(plan, 0): 
+            raise HTTPException(403, f"Plan excede límite de documentos.")
+            
     await consume_analysis_credit(user_id, plan)
 
     max_size_mb = PLAN_SIZE_LIMITS.get(plan, 10)
     model_parts = []
-    original_filenames = []
     bucket = storage_client.bucket(GCS_BUCKET_NAME)
 
+    # 2. Reconstruir los documentos (model_parts)
     for f_info in files_info:
         gs_uri = f_info.get("gs_uri")
         mime_type = f_info.get("mime_type", "application/pdf")
@@ -492,20 +518,40 @@ async def analyze_documents(
                 blob.delete()
                 raise HTTPException(400, f"EXCEDE_TAMANO: '{original_filename}' excede los {max_size_mb} MB.")
         except HTTPException as he: raise he
-        except Exception as e: print(f"Error en GCS: {e}")
+        except Exception as e: print(f"Error validando archivo en GCS: {e}")
 
-        original_filenames.append(original_filename)
+        if not is_follow_up:
+            original_filenames.append(original_filename)
         
-        # 👇 CAMBIO CRÍTICO: Uso de `file_uri=` en lugar de `uri=`
         if mime_type == "application/pdf":
             model_parts.append(types.Part.from_uri(file_uri=gs_uri, mime_type="application/pdf"))
         else:
             text = await asyncio.to_thread(download_and_parse_docx, gs_uri)
-            model_parts.append(f"--- DOC: {original_filename} ---\n{text}\n------\n")
+            model_parts.append(types.Part.from_text(text=f"--- DOC: {original_filename} ---\n{text}\n------\n"))
 
-    model_parts.append(f"\nINSTRUCCIONES E HISTORIAL:\n{instructions}")
+    # 3. Construir lista Nativa de Contenidos (Chat History)
+    contents = []
+    
+    if not is_follow_up:
+        db_history.append({"role": "user", "content": instructions})
+        user_parts = model_parts + [types.Part.from_text(text=f"\nINSTRUCCIONES DEL USUARIO:\n{instructions}")]
+        contents.append(types.Content(role="user", parts=user_parts))
+    else:
+        for i, msg in enumerate(db_history):
+            role = msg.get("role", "user")
+            text_part = types.Part.from_text(text=msg.get("content", ""))
+            
+            # Anclar los documentos únicamente en el primer mensaje
+            if i == 0 and role == "user":
+                contents.append(types.Content(role=role, parts=model_parts + [text_part]))
+            else:
+                contents.append(types.Content(role=role, parts=[text_part]))
+                
+        # Agregar nueva pregunta con directriz
+        db_history.append({"role": "user", "content": instructions})
+        follow_up_prompt = f"[NUEVA PREGUNTA]\n{instructions}\n\n[SISTEMA]: Responde EXCLUSIVAMENTE a esta pregunta basada en los documentos analizados. NO repitas el análisis inicial. Termina siempre con ---PREGUNTAS--- sugiriendo 3 opciones."
+        contents.append(types.Content(role="user", parts=[types.Part.from_text(text=follow_up_prompt)]))
 
-    # 👇 NUEVA ESTRUCTURA DE CONFIGURACIÓN Y SEGURIDAD
     gen_config = types.GenerateContentConfig(
         system_instruction=ANALYZER_SYSTEM_PROMPT,
         temperature=float(os.getenv("GEMINI_TEMP", "0.4")),
@@ -523,7 +569,7 @@ async def analyze_documents(
         has_error = False; tokens_sent = False
         try:
             async for chunk in stream_analysis_generator(
-                genai_client, GEMINI_MODEL_NAME, model_parts, gen_config, current_user, instructions, original_filenames, analysis_id, history_json
+                genai_client, GEMINI_MODEL_NAME, contents, gen_config, current_user, instructions, original_filenames, files_info, analysis_id, db_history
             ):
                 if '"error":' in chunk: has_error = True
                 if '"text":' in chunk and not has_error: tokens_sent = True
