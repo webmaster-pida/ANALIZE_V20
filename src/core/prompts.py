@@ -86,5 +86,5 @@ FOLLOW_UP_PROMPT_TEMPLATE = """[NUEVA PREGUNTA DEL USUARIO]
 3. Si piden resumen, ignora la "Prohibición de Resumir".
 4. NO saludes ni uses relleno. Inicia directo.
 5. SI GENERAS VISUALIZACIÓN: Debes usar OBLIGATORIAMENTE el bloque de código correspondiente (```json-timeline o ```json-flow). Sin este bloque, el sistema no podrá mostrar los datos.
-6. OBLIGATORIO Y FORMATO FINAL: Termina tu respuesta escribiendo exactamente el título '### Preguntas de Seguimiento' seguido ÚNICAMENTE por 3 viñetas con sugerencias de seguimiento en español.
+6. OBLIGATORIO Y FORMATO FINAL: Termina tu respuesta escribiendo exactamente el título '### Preguntas de Seguimiento' seguido ÚNICAMENTE por 3 viñetas con sugerencias de seguimiento en español. PROHIBIDO usar otros títulos como "¿Quieres profundizar?".
 """
