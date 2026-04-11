@@ -563,22 +563,7 @@ async def analyze_documents(
                 contents.append(types.Content(role=role, parts=[text_part]))
                 
         # Agregar nueva pregunta con la directriz centralizada
-        db_history.append({"role": "user", "content": instructions})
         follow_up_prompt = FOLLOW_UP_PROMPT_TEMPLATE.format(instructions=instructions)
-        contents.append(types.Content(role="user", parts=[types.Part.from_text(text=follow_up_prompt)]))
-                
-        # Agregar nueva pregunta con directriz
-        db_history.append({"role": "user", "content": instructions})
-        # Agregar nueva pregunta con directriz para anular el sobre-análisis innecesario, pero MANTENIENDO el rol de experto, evitando alucinaciones y forzando el formato
-        follow_up_prompt = f"""[NUEVA PREGUNTA]
-{instructions}
-
-[SISTEMA]: Responde a esta pregunta en ESPAÑOL. REGLAS ESTRICTAS PARA ESTA RESPUESTA DE SEGUIMIENTO:
-1. MANTÉN TU ROL de Jurista experto. Si la pregunta del usuario requiere evaluar viabilidad, comparar opciones, proponer estrategias o emitir una opinión legal que no está escrita literalmente en el documento, DEBES utilizar tu propio conocimiento jurídico experto para analizar y proponer.
-2. CERO ALUCINACIONES: Tu análisis experto debe basarse estrictamente en los *hechos* reales del documento. Aplica tu conocimiento legal, pero no inventes información ni datos que el texto original no contiene.
-3. Si el usuario pide explícitamente un resumen, ignora tu instrucción base de 'Prohibición de Resumir'.
-4. OBLIGATORIO Y FORMATO FINAL: Termina tu respuesta escribiendo exactamente el título '### Preguntas de Seguimiento' seguido ÚNICAMENTE por 3 viñetas con sugerencias de seguimiento en español."""
-        
         contents.append(types.Content(role="user", parts=[types.Part.from_text(text=follow_up_prompt)]))
 
     gen_config = types.GenerateContentConfig(
