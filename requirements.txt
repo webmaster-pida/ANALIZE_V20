@@ -5,7 +5,7 @@ python-docx
 fpdf
 markdown-it-py
 google-cloud-firestore
-google-cloud-aiplatform
+google-genai>=0.71.0
 google-cloud-storage
 python-dotenv
 httpx
