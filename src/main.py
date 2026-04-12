@@ -43,7 +43,7 @@ try:
         credentials = impersonated_credentials.Credentials(
             source_credentials=raw_credentials,
             target_principal="analize-v20@pida-ai-v20.iam.gserviceaccount.com",
-            target_scopes=["https://www.googleapis.com/auth/cloud-platform"],
+            target_scopes=["[https://www.googleapis.com/auth/cloud-platform](https://www.googleapis.com/auth/cloud-platform)"],
             lifetime=3600
         )
     else:
@@ -90,11 +90,11 @@ LIMIT_SIZE_MB_PREMIUM = int(os.getenv("LIMIT_SIZE_MB_PREMIUM", 50))
 LIMIT_SIZE_MB_VIP = int(os.getenv("LIMIT_SIZE_MB_VIP", 50))
 
 # --- CORS ---
-raw_origins = os.getenv("ALLOWED_ORIGINS", '["https://pida-ai.com"]')
+raw_origins = os.getenv("ALLOWED_ORIGINS", '["[https://pida-ai.com](https://pida-ai.com)"]')
 try:
     origins = json.loads(raw_origins)
 except:
-    origins = ["https://pida-ai.com"]
+    origins = ["[https://pida-ai.com](https://pida-ai.com)"]
 
 app.add_middleware(
     CORSMiddleware,
@@ -363,6 +363,59 @@ def create_pdf_sync(analysis_text: str, instructions: str) -> tuple[bytes, str, 
         err = FPDF(); err.add_page(); err.multi_cell(0, 10, f"Error: {str(e)}")
         return err.output(dest='S').encode('latin-1'), "application/pdf", "Error.pdf"
 
+
+def format_json_visualizations_for_export(text: str) -> str:
+    """
+    Busca los bloques de JSON nativos en el texto de análisis y los 
+    convierte en Tablas Markdown para que las funciones de PDF y DOCX
+    puedan dibujarlos correctamente.
+    """
+    if not text:
+        return ""
+        
+    # --- CONVERTIR TIMELINE EN TABLA ---
+    def replace_timeline(match):
+        raw_json = match.group(1).strip()
+        raw_json = re.sub(r'`{3}(?:json-timeline|json)?', '', raw_json, flags=re.IGNORECASE).replace('`'*3, '').strip()
+        try:
+            data = json.loads(raw_json)
+            if not data: return ""
+            table = "\n### Línea de Tiempo\n\n| Fecha | Fase | Descripción |\n|---|---|---|\n"
+            for item in data:
+                date = str(item.get('date', '')).replace('\n', ' ').strip()
+                phase = str(item.get('phase', '')).replace('\n', ' ').strip()
+                desc = str(item.get('description', '')).replace('\n', ' ').strip()
+                table += f"| **{date}** | {phase} | {desc} |\n"
+            return table + "\n"
+        except Exception as e:
+            print(f"Error exportando Timeline: {e}")
+            return match.group(0)
+
+    text = re.sub(r'\[TIMELINE_START\](.*?)\[TIMELINE_END\]', replace_timeline, text, flags=re.DOTALL | re.IGNORECASE)
+
+    # --- CONVERTIR FLOW EN TABLA ---
+    def replace_flow(match):
+        raw_json = match.group(1).strip()
+        raw_json = re.sub(r'`{3}(?:json-flow|json)?', '', raw_json, flags=re.IGNORECASE).replace('`'*3, '').strip()
+        try:
+            data = json.loads(raw_json)
+            if not data: return ""
+            table = "\n### Diagrama de Flujo / Proceso\n\n| Paso | Requisito | Acción |\n|---|---|---|\n"
+            for i, item in enumerate(data):
+                step = str(item.get('step', '')).replace('\n', ' ').strip()
+                req = str(item.get('requirement', '')).replace('\n', ' ').strip()
+                action = str(item.get('action', '')).replace('\n', ' ').strip()
+                table += f"| **{i+1}. {step}** | {req} | {action} |\n"
+            return table + "\n"
+        except Exception as e:
+            print(f"Error exportando Flow: {e}")
+            return match.group(0)
+
+    text = re.sub(r'\[FLOW_START\](.*?)\[FLOW_END\]', replace_flow, text, flags=re.DOTALL | re.IGNORECASE)
+
+    return text
+
+
 # --- CORE GENAI STREAMING GENERATOR ---
 async def stream_analysis_generator(genai_client, model_name, contents, gen_config, current_user, instructions, original_filenames, files_info, analysis_id, db_history):
     full_text = ""
@@ -566,6 +619,8 @@ async def analyze_documents(
         # Y NO duplicamos db_history.append aquí (ya se hace en el stream_generator)
         follow_up_prompt = FOLLOW_UP_PROMPT_TEMPLATE.format(instructions=instructions)
         contents.append(types.Content(role="user", parts=[types.Part.from_text(text=follow_up_prompt)]))
+        
+        # FIX: Guardar la nueva pregunta del usuario en la base de datos para follow-ups
         db_history.append({"role": "user", "content": instructions})
 
     gen_config = types.GenerateContentConfig(
@@ -612,6 +667,9 @@ async def download_analysis(
                 else: chat_lines.append(f"**{'Instrucción' if role == 'user' else 'Análisis PIDA'}:**\n{content}")
             analysis_text = "\n\n".join(chat_lines)
         except Exception: pass
+
+    # Transformar los bloques JSON a tablas Markdown antes de convertirlos
+    analysis_text = format_json_visualizations_for_export(analysis_text)
 
     analysis_text = analysis_text[:500000] + "\n\n[Texto truncado]" if len(analysis_text) > 500000 else analysis_text
     instructions = instructions[:5000] + "..." if len(instructions) > 5000 else instructions
