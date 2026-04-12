@@ -566,6 +566,7 @@ async def analyze_documents(
         # Y NO duplicamos db_history.append aquí (ya se hace en el stream_generator)
         follow_up_prompt = FOLLOW_UP_PROMPT_TEMPLATE.format(instructions=instructions)
         contents.append(types.Content(role="user", parts=[types.Part.from_text(text=follow_up_prompt)]))
+        db_history.append({"role": "user", "content": instructions})
 
     gen_config = types.GenerateContentConfig(
         system_instruction=ANALYZER_SYSTEM_PROMPT,
