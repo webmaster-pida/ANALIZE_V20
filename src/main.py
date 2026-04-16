@@ -223,48 +223,156 @@ def render_table_row_fpdf(pdf, cells):
     pdf.set_xy(pdf.l_margin, start_y + row_height)
 
 def write_markdown_to_pdf(pdf, text):
-    pdf.set_font("Arial", "", 10)
-    lines = text.strip().split('\n')
+    import re
+    pdf.set_font("Arial", "", 11)
+    
+    try:
+        effective_page_width = pdf.epw
+    except AttributeError:
+        effective_page_width = pdf.w - pdf.l_margin - pdf.r_margin
+        
+    text = text.replace('$', '').replace('^{a}', 'a.').replace('^{o}', 'o.')
+    
+    lines = text.split('\n')
     i = 0
     while i < len(lines):
         line = lines[i].strip()
+        
+        # --- 1. PROCESAMIENTO DE TABLAS MARKDOWN ---
         if line.startswith('|') and line.endswith('|'):
             table_lines = []
+            # Agrupar todas las líneas de la tabla antes de dibujar
             while i < len(lines) and lines[i].strip().startswith('|') and lines[i].strip().endswith('|'):
-                table_lines.append(lines[i].strip()); i += 1
+                table_lines.append(lines[i].strip())
+                i += 1
+                
             for r_idx, t_line in enumerate(table_lines):
-                cells = [c.strip() for c in t_line.split('|')[1:-1]]
-                if all(re.match(r'^:?-+:?$', c) for c in cells): continue 
-                if len(cells) > 0:
-                    pdf.set_font("Arial", "B", 10) if r_idx == 0 else pdf.set_font("Arial", "", 10)
-                    render_table_row_fpdf(pdf, cells)
-            pdf.ln(5); pdf.set_font("Arial", "", 10); continue
+                cols = [c.strip() for c in t_line.split('|')[1:-1]]
+                
+                # Ignorar filas separadoras (ej. |---|---|)
+                if all(re.match(r'^:?-+:?$', c) for c in cols):
+                    continue
+                if not cols:
+                    continue
+                    
+                col_width = effective_page_width / len(cols)
+                
+                # Función interna para calcular la altura dinámica de la celda
+                def get_cell_height(w, txt, is_bold):
+                    pdf.set_font("Arial", "B" if is_bold else "", 10)
+                    try: margin = pdf.c_margin
+                    except: margin = 1
+                    usable_w = w - (2 * margin) # Restar márgenes internos de FPDF
+                    
+                    lines_count = 0
+                    for p in str(txt).split('\n'):
+                        words = p.split(' ')
+                        if not words or (len(words) == 1 and words[0] == ''):
+                            lines_count += 1; continue
+                        curr_line = ""
+                        for word in words:
+                            if pdf.get_string_width(curr_line + word + " ") > usable_w and curr_line:
+                                lines_count += 1; curr_line = word + " "
+                            else: 
+                                curr_line += word + " "
+                        lines_count += 1
+                    return lines_count * 6
+                
+                is_header = (r_idx == 0)
+                # Calcular la altura de la fila basándose en la celda con más texto
+                max_height = max([get_cell_height(col_width, c.replace('**', '').replace('<br>', '\n').replace('<br/>', '\n'), is_bold=(is_header or '**' in c)) for c in cols] + [6])
+                
+                # Prevenir salto de página a la mitad de una fila
+                try: pb_trigger = pdf.page_break_trigger
+                except: pb_trigger = pdf.h - pdf.b_margin
+                if pdf.get_y() + max_height > pb_trigger:
+                    pdf.add_page()
+                    
+                x_start = pdf.get_x()
+                y_start = pdf.get_y()
+                
+                # Dibujar las celdas
+                for c_idx, col in enumerate(cols):
+                    col_clean = col.replace('**', '')
+                    col_clean = re.sub(r'<br\s*/?>', '\n', col_clean, flags=re.IGNORECASE)
+                    
+                    # Dibujar fondo y contorno FIRST
+                    if is_header:
+                        pdf.set_fill_color(241, 245, 249) # Azul muy claro tipo Tailwind (#f1f5f9)
+                        pdf.rect(x_start + (c_idx * col_width), y_start, col_width, max_height, 'DF')
+                    else:
+                        pdf.rect(x_start + (c_idx * col_width), y_start, col_width, max_height)
+                    
+                    # Imprimir el texto encima
+                    pdf.set_xy(x_start + (c_idx * col_width), y_start)
+                    pdf.set_font("Arial", "B" if "**" in col or is_header else "", 10)
+                    
+                    if is_header:
+                        pdf.set_text_color(29, 53, 87) # Azul marino
+                    else:
+                        pdf.set_text_color(0, 0, 0)
+                        
+                    pdf.multi_cell(col_width, 6, col_clean, border=0, align='L')
+                
+                # Acomodar el cursor debajo de la fila recién dibujada
+                pdf.set_xy(x_start, y_start + max_height)
             
-        if not line: pdf.ln(5)
-        elif line.startswith('### '):
-            pdf.ln(4); pdf.set_font("Arial", "B", 11); pdf.set_text_color(0, 51, 102)
-            pdf.multi_cell(0, 7, line.replace('### ', '')); pdf.set_text_color(0, 0, 0); pdf.set_font("Arial", "", 10)
-        elif line.startswith('## '):
-            pdf.ln(3); pdf.set_font("Arial", "B", 12); pdf.set_text_color(29, 53, 87)
-            pdf.multi_cell(0, 8, line.replace('## ', '')); pdf.set_text_color(0, 0, 0); pdf.set_font("Arial", "", 10)
-        elif line.startswith('# '):
-            pdf.ln(5); pdf.set_font("Arial", "B", 14); pdf.set_text_color(185, 47, 50)
-            pdf.multi_cell(0, 10, line.replace('# ', '')); pdf.set_text_color(0, 0, 0); pdf.set_font("Arial", "", 10)
-        elif line.startswith('* ') or line.startswith('- '):
-            pdf.set_x(15); pdf.write(6, "- ")
-            for part in re.split(r'(\*\*.*?\*\*)', line[2:]):
-                if part.startswith('**') and part.endswith('**'):
-                    pdf.set_font("Arial", "B", 10); pdf.write(6, part.strip('*')); pdf.set_font("Arial", "", 10)
-                else: pdf.write(6, part)
-            pdf.ln(6)
-        else:
-            for part in re.split(r'(\*\*.*?\*\*)', line):
-                if part.startswith('**') and part.endswith('**'):
-                    pdf.set_font("Arial", "B", 10); pdf.write(6, part.strip('*')); pdf.set_font("Arial", "", 10)
-                else: pdf.write(6, part)
-            pdf.ln(6)
-        i += 1
+            # Restaurar colores y fuentes al terminar la tabla
+            pdf.set_font("Arial", "", 11)
+            pdf.set_text_color(0, 0, 0)
+            pdf.ln(5)
+            continue
 
+        # --- 2. ESPACIOS VACÍOS ---
+        if not line:
+            pdf.ln(5)
+            i += 1
+            continue
+
+        # --- 3. ENCABEZADOS PRINCIPALES (##) ---
+        if line.startswith('## '):
+            pdf.ln(3)
+            pdf.set_font("Arial", "B", 13)
+            pdf.set_text_color(29, 53, 87)
+            clean_line = re.sub(r'<br\s*/?>', ' ', line.replace('## ', ''), flags=re.IGNORECASE)
+            pdf.multi_cell(0, 8, clean_line)
+            pdf.set_text_color(0, 0, 0)
+            pdf.set_font("Arial", "", 11)
+            i += 1
+            continue
+            
+        # --- 4. SUBTÍTULOS (###) ---
+        if line.startswith('### '):
+            pdf.ln(2)
+            pdf.set_font("Arial", "B", 12)
+            pdf.set_text_color(40, 70, 100)
+            clean_line = re.sub(r'<br\s*/?>', ' ', line.replace('### ', ''), flags=re.IGNORECASE)
+            pdf.multi_cell(0, 7, clean_line)
+            pdf.set_text_color(0, 0, 0)
+            pdf.set_font("Arial", "", 11)
+            i += 1
+            continue
+
+        # --- 5. LISTAS Y PÁRRAFOS REGULARES ---
+        if line.startswith('* ') or line.startswith('- '):
+            pdf.set_x(15)
+            line = "- " + line[2:]
+        else:
+            pdf.set_x(10)
+
+        line = re.sub(r'<br\s*/?>', '', line, flags=re.IGNORECASE)
+
+        parts = re.split(r'(\*\*.*?\*\*)', line)
+        for part in parts:
+            if part.startswith('**') and part.endswith('**'):
+                pdf.set_font("Arial", "B", 11)
+                pdf.write(6, part.strip('*'))
+                pdf.set_font("Arial", "", 11)
+            else:
+                pdf.write(6, part)
+        pdf.ln(6)
+        
+        i += 1
 def parse_and_add_markdown_to_docx(document, markdown_text):
     lines = markdown_text.strip().split('\n')
     i = 0
@@ -281,7 +389,12 @@ def parse_and_add_markdown_to_docx(document, markdown_text):
                 except: pass
                 for col_idx, header in enumerate(headers):
                     if col_idx < len(table.rows[0].cells):
-                        table.rows[0].cells[col_idx].text = header.replace('**', '').replace('<br>', '\n').replace('<br/>', '\n')
+                        cell_text = header.replace('**', '').replace('<br>', '\n').replace('<br/>', '\n')
+                        # En lugar de asignar el texto directo, lo hacemos con un "run" para poner negrita
+                        p = table.rows[0].cells[col_idx].paragraphs[0]
+                        p.text = "" 
+                        run = p.add_run(cell_text)
+                        run.bold = True
                 
                 start_idx = 2 if len(table_lines) > 1 and all(re.match(r'^:?-+:?$', c.strip()) for c in table_lines[1].split('|')[1:-1]) else 1
                 for r_idx in range(start_idx, len(table_lines)):
