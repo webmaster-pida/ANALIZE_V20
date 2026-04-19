@@ -762,7 +762,13 @@ async def analyze_documents(
         finally:
             if has_error or not tokens_sent: asyncio.create_task(refund_analysis_credit(user_id))
 
-    return StreamingResponse(counted_stream_generator(), media_type="text/event-stream")
+    headers = { 
+        "Content-Type": "text/event-stream", 
+        "Cache-Control": "no-cache", 
+        "Connection": "keep-alive", 
+        "X-Accel-Buffering": "no" 
+    }
+    return StreamingResponse(counted_stream_generator(), headers=headers)
 
 @app.post("/download-analysis")
 async def download_analysis(
