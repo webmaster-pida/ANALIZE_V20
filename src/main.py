@@ -43,7 +43,8 @@ try:
         credentials = impersonated_credentials.Credentials(
             source_credentials=raw_credentials,
             target_principal="analize-v20@pida-ai-v20.iam.gserviceaccount.com",
-            target_scopes=["[https://www.googleapis.com/auth/cloud-platform](https://www.googleapis.com/auth/cloud-platform)"],
+            # ✅ URL LIMPIA:
+            target_scopes=["https://www.googleapis.com/auth/cloud-platform"],
             lifetime=3600
         )
     else:
