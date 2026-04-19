@@ -753,6 +753,9 @@ async def analyze_documents(
     async def counted_stream_generator():
         has_error = False; tokens_sent = False
         try:
+            # 👇 AQUÍ ESTÁ EL LATIDO: Se envía inmediatamente para mantener viva la conexión QUIC/TCP
+            yield f"data: {json.dumps({'status': 'Analizando contenido extenso. Esto puede tomar un momento...'})}\n\n"
+            
             async for chunk in stream_analysis_generator(
                 genai_client, GEMINI_MODEL_NAME, contents, gen_config, current_user, instructions, original_filenames, files_info, analysis_id, db_history
             ):
@@ -762,12 +765,14 @@ async def analyze_documents(
         finally:
             if has_error or not tokens_sent: asyncio.create_task(refund_analysis_credit(user_id))
 
+    # 👇 HEADERS ANTIBÚFER: Para que el latido y el texto salgan al instante
     headers = { 
         "Content-Type": "text/event-stream", 
         "Cache-Control": "no-cache", 
         "Connection": "keep-alive", 
         "X-Accel-Buffering": "no" 
     }
+    
     return StreamingResponse(counted_stream_generator(), headers=headers)
 
 @app.post("/download-analysis")
