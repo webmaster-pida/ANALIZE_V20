@@ -765,6 +765,19 @@ async def analyze_documents(
         finally:
             if has_error or not tokens_sent: asyncio.create_task(refund_analysis_credit(user_id))
 
+    # =====================================================================
+    # NUEVO: REGISTRO DE ESTADÍSTICA MENSUAL (AHORRO DE LECTURAS)
+    # =====================================================================
+    try:
+        current_month = datetime.now().strftime("%Y-%m")
+        stats_ref = db.collection('monthly_stats').document(current_month)
+        await stats_ref.set({
+            "analisis": firestore.Increment(1)
+        }, merge=True)
+    except Exception as stats_e:
+        print(f"Error guardando estadística mensual de análisis: {stats_e}")
+    # =====================================================================
+
     # 👇 HEADERS ANTIBÚFER: Para que el latido y el texto salgan al instante
     headers = { 
         "Content-Type": "text/event-stream", 
