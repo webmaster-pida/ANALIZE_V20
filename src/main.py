@@ -5,7 +5,7 @@ import json
 import io
 import re
 import asyncio
-import httpx  # <-- NUEVO: Para consultar el RAG
+import httpx  # <-- Para consultar el RAG
 import fitz  # PyMuPDF para comprimir PDFs
 from fastapi import FastAPI, File, Form, UploadFile, HTTPException, Response, Depends, Body
 from fastapi.middleware.cors import CORSMiddleware
@@ -755,9 +755,11 @@ async def analyze_documents(
         # Usamos el prompt centralizado de primer turno
         first_turn_prompt = FIRST_TURN_PROMPT_TEMPLATE.format(instructions=instructions)
         
-        # 👇 INYECTAMOS EL RAG AQUÍ
+        # 👇 INYECTAMOS EL RAG CON REGLA DE AUTORIDAD SUPREMA
         if rag_context_text:
-            first_turn_prompt += f"\n\nInstrucción adicional: Toma en cuenta el siguiente contexto de jurisprudencia y documentos internos de PIDA para complementar tu análisis si es relevante a la pregunta.\n{rag_context_text}"
+            first_turn_prompt += f"""\n\n[CONTEXTO INTERNO DE JURISPRUDENCIA (RAG)]
+(⚠️ REGLA SUPREMA DE VERACIDAD: El contenido de este bloque de RAG contiene la verdad absoluta y la información más actualizada. Si este bloque menciona sentencias, leyes u Opiniones Consultivas (ej. OC-31/25), asume obligatoriamente que SON REALES, VIGENTES Y EXISTEN. Tienes ESTRICTAMENTE PROHIBIDO negar su existencia o contradecir esta información basándote en tu conocimiento previo o fechas de corte de entrenamiento).
+{rag_context_text}"""
             
         user_parts = model_parts + [types.Part.from_text(text=first_turn_prompt)]
         contents.append(types.Content(role="user", parts=user_parts))
