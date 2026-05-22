@@ -5,6 +5,7 @@ import json
 import io
 import re
 import asyncio
+import httpx  # <-- NUEVO: Para consultar el RAG
 import fitz  # PyMuPDF para comprimir PDFs
 from fastapi import FastAPI, File, Form, UploadFile, HTTPException, Response, Depends, Body
 from fastapi.middleware.cors import CORSMiddleware
@@ -74,7 +75,7 @@ if PROJECT_ID:
 # Inicializar Firestore
 db = AsyncClient(project=PROJECT_ID)
 
-app = FastAPI(title="PIDA Document Analyzer (Streaming & GCS)")
+app = FastAPI(title="PIDA Document Analyzer (Streaming, GCS & RAG)")
 
 # --- VARIABLES DE LÍMITES DE NEGOCIO ---
 LIMIT_BASICO_ANALYSIS_DAILY = int(os.getenv("LIMIT_BASICO_ANALYSIS_DAILY", 3))
@@ -708,6 +709,43 @@ async def analyze_documents(
             text = await asyncio.to_thread(download_and_parse_docx, gs_uri)
             model_parts.append(types.Part.from_text(text=f"--- DOC: {original_filename} ---\n{text}\n------\n"))
 
+    # =====================================================================
+    # NUEVO: LÓGICA DE INTEGRACIÓN CON RAG INTERNO (TOLERANTE A FALLOS)
+    # =====================================================================
+    rag_context_text = ""
+    if not is_follow_up: # Idealmente solo lo consultamos en la pregunta inicial para no saturar
+        try:
+            rag_url = os.getenv("RAG_API_URL")
+            if rag_url:
+                print("Consultando RAG interno para enriquecer contexto del analizador...")
+                timeout_config = httpx.Timeout(15.0, connect=5.0)
+                
+                async with httpx.AsyncClient(timeout=timeout_config) as http_client:
+                    resp = await http_client.post(rag_url, json={"query": instructions})
+                    if resp.status_code == 200:
+                        rag_data = resp.json()
+                        if rag_data and "results" in rag_data and rag_data["results"]:
+                            rag_context_text = "\n\n### Contexto de Documentos Internos (RAG):\n"
+                            
+                            for doc in rag_data.get("results", []):
+                                title = doc.get("title")
+                                author = doc.get("author")
+                                source_filename = doc.get("source")
+                                content = doc.get("content", "").replace("\n", " ").strip()
+                                
+                                display_title = title or source_filename or "Documento Interno"
+                                citation_line = f"Título: {display_title}"
+                                if author and author.strip() and author != "Autor Desconocido":
+                                    citation_line += f" | Autor: {author}"
+                                else:
+                                    citation_line += f" | Autor: Institucional/No especificado"
+                                
+                                rag_context_text += f"{citation_line}\n**Texto:**\n> {content}\n\n"
+                            print("Contexto RAG obtenido exitosamente.")
+        except Exception as e:
+            print(f"Error consultando RAG (silenciado para no afectar análisis): {e}")
+    # =====================================================================
+
     # 3. Construir lista Nativa de Contenidos (Chat History)
     contents = []
     
@@ -716,6 +754,11 @@ async def analyze_documents(
         
         # Usamos el prompt centralizado de primer turno
         first_turn_prompt = FIRST_TURN_PROMPT_TEMPLATE.format(instructions=instructions)
+        
+        # 👇 INYECTAMOS EL RAG AQUÍ
+        if rag_context_text:
+            first_turn_prompt += f"\n\nInstrucción adicional: Toma en cuenta el siguiente contexto de jurisprudencia y documentos internos de PIDA para complementar tu análisis si es relevante a la pregunta.\n{rag_context_text}"
+            
         user_parts = model_parts + [types.Part.from_text(text=first_turn_prompt)]
         contents.append(types.Content(role="user", parts=user_parts))
     else:
