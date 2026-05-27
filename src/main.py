@@ -746,16 +746,18 @@ async def analyze_documents(
             print(f"Error consultando RAG (silenciado para no afectar análisis): {e}")
     # =====================================================================
 
-    # 3. Construir lista Nativa de Contenidos (Chat History)
+    # =====================================================================
+    # 3. Construir lista Nativa de Contenidos (Chat History) - BLINDADO
+    # =====================================================================
     contents = []
     
     if not is_follow_up:
         db_history.append({"role": "user", "content": instructions})
         
-        # Usamos el prompt centralizado de primer turno
+        # Usamos el prompt centralizado de primer turno (que ahora añade <user_input>)
         first_turn_prompt = FIRST_TURN_PROMPT_TEMPLATE.format(instructions=instructions)
         
-        # 👇 INYECTAMOS EL RAG CON REGLA DE AUTORIDAD SUPREMA
+        # Inyección controlada del RAG
         if rag_context_text:
             first_turn_prompt += f"""\n\n[CONTEXTO INTERNO DE JURISPRUDENCIA (RAG)]
 (⚠️ REGLA SUPREMA DE VERACIDAD: El contenido de este bloque de RAG contiene la verdad absoluta y la información más actualizada. Si este bloque menciona sentencias, leyes u Opiniones Consultivas (ej. OC-31/25), asume obligatoriamente que SON REALES, VIGENTES Y EXISTEN. Tienes ESTRICTAMENTE PROHIBIDO negar su existencia o contradecir esta información basándote en tu conocimiento previo o fechas de corte de entrenamiento).
@@ -766,20 +768,29 @@ async def analyze_documents(
     else:
         for i, msg in enumerate(db_history):
             role = msg.get("role", "user")
-            text_part = types.Part.from_text(text=msg.get("content", ""))
+            raw_content = msg.get("content", "")
             
-            # Anclar los documentos únicamente en el primer mensaje
+            # --- BLINDAJE DEL HISTORIAL DE TURNOS PREVIOS ---
+            # Si el mensaje viejo era del usuario y no tenía etiquetas XML, se las forzamos
+            if role == "user" and "<user_input>" not in raw_content:
+                safe_content = f"<user_input>\n{raw_content}\n</user_input>"
+            else:
+                safe_content = raw_content
+            # ------------------------------------------------
+            
+            text_part = types.Part.from_text(text=safe_content)
+            
+            # Anclar los documentos de forma segura únicamente en el primer mensaje
             if i == 0 and role == "user":
                 contents.append(types.Content(role=role, parts=model_parts + [text_part]))
             else:
                 contents.append(types.Content(role=role, parts=[text_part]))
                 
-        # IMPORTANTE: Usamos la plantilla centralizada para que SIEMPRE lleve las reglas del JSON
-        # Y NO duplicamos db_history.append aquí (ya se hace en el stream_generator)
+        # Construimos la nueva pregunta del seguimiento usando la plantilla blindada
         follow_up_prompt = FOLLOW_UP_PROMPT_TEMPLATE.format(instructions=instructions)
         contents.append(types.Content(role="user", parts=[types.Part.from_text(text=follow_up_prompt)]))
         
-        # FIX: Guardar la nueva pregunta del usuario en la base de datos para follow-ups
+        # Guardar la nueva pregunta del usuario limpia en la base de datos para los siguientes turnos
         db_history.append({"role": "user", "content": instructions})
 
     gen_config = types.GenerateContentConfig(
