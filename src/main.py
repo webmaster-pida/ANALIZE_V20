@@ -431,8 +431,30 @@ class PDF(FPDF):
 def read_docx_sync(content: bytes) -> str:
     try:
         doc = Document(io.BytesIO(content))
-        return "\n".join([p.text for p in doc.paragraphs])
-    except: return ""
+        text_pieces = []
+        
+        # 1. Extraer texto de párrafos normales
+        for p in doc.paragraphs:
+            if p.text.strip():
+                text_pieces.append(p.text)
+                
+        # 2. Extraer texto de tablas (Crucial para Marcos Lógicos)
+        for table in doc.tables:
+            for row in table.rows:
+                # Combinar el texto de las celdas de la fila separadas por un guion o barra
+                row_text = [cell.text.strip() for cell in row.cells if cell.text.strip()]
+                if row_text:
+                    # Evitar duplicados consecutivos si hay celdas combinadas
+                    clean_row = []
+                    for text in row_text:
+                        if not clean_row or text != clean_row[-1]:
+                            clean_row.append(text)
+                    text_pieces.append(" | ".join(clean_row))
+                    
+        return "\n".join(text_pieces)
+    except Exception as e:
+        print(f"Error parseando DOCX detallado: {e}")
+        return ""
 
 def download_and_parse_docx(gs_uri: str) -> str:
     try:
