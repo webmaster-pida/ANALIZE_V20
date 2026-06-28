@@ -92,11 +92,11 @@ LIMIT_SIZE_MB_PREMIUM = int(os.getenv("LIMIT_SIZE_MB_PREMIUM", 50))
 LIMIT_SIZE_MB_VIP = int(os.getenv("LIMIT_SIZE_MB_VIP", 50))
 
 # --- CORS ---
-raw_origins = os.getenv("ALLOWED_ORIGINS", '["[https://pida-ai.com](https://pida-ai.com)"]')
+raw_origins = os.getenv("ALLOWED_ORIGINS", '["https://pida-ai.com"]')
 try:
     origins = json.loads(raw_origins)
 except:
-    origins = ["[https://pida-ai.com](https://pida-ai.com)"]
+    origins = ["https://pida-ai.com"]
 
 app.add_middleware(
     CORSMiddleware,
@@ -131,6 +131,8 @@ def get_date_utc_minus_6() -> str:
 async def get_user_plan_unified(current_user: Dict[str, Any]) -> str:
     user_id = current_user.get('uid')
     user_email = current_user.get('email', '').strip().lower()
+    email_verified = current_user.get("email_verified", False)
+    
     try:
         raw_domains = os.getenv("ADMIN_DOMAINS", '[]')
         raw_emails = os.getenv("ADMIN_EMAILS", '[]')
@@ -140,7 +142,17 @@ async def get_user_plan_unified(current_user: Dict[str, Any]) -> str:
         admin_domains, admin_emails = [], []
 
     email_domain = user_email.split("@")[-1] if "@" in user_email else ""
-    if (email_domain in admin_domains) or (user_email in admin_emails): return 'vip'
+    
+    # 1. EXCEPCIÓN VIP/ADMINISTRADORES: Si pertenece a tus listas autorizadas, pasa directo de forma ilimitada
+    if (email_domain in admin_domains) or (user_email in admin_emails): 
+        return 'vip'
+
+    # 2. BLINDAJE AUTOMÁTICO DE SEGURIDAD: Denegar acceso instantáneo a usuarios normales si el correo es falso/no verificado
+    if not email_verified:
+        raise HTTPException(
+            status_code=403, 
+            detail="Tu dirección de correo electrónico no ha sido verificada. Por favor, haz clic en el enlace enviado a tu bandeja de entrada antes de utilizar el analizador."
+        )
 
     try:
         cust_doc = await db.collection('customers').document(user_id).get()
@@ -243,7 +255,6 @@ def write_markdown_to_pdf(pdf, text):
         # --- 1. PROCESAMIENTO DE TABLAS MARKDOWN ---
         if line.startswith('|') and line.endswith('|'):
             table_lines = []
-            # Agrupar todas las líneas de la tabla antes de dibujar
             while i < len(lines) and lines[i].strip().startswith('|') and lines[i].strip().endswith('|'):
                 table_lines.append(lines[i].strip())
                 i += 1
@@ -251,7 +262,6 @@ def write_markdown_to_pdf(pdf, text):
             for r_idx, t_line in enumerate(table_lines):
                 cols = [c.strip() for c in t_line.split('|')[1:-1]]
                 
-                # Ignorar filas separadoras (ej. |---|---|)
                 if all(re.match(r'^:?-+:?$', c) for c in cols):
                     continue
                 if not cols:
@@ -259,12 +269,11 @@ def write_markdown_to_pdf(pdf, text):
                     
                 col_width = effective_page_width / len(cols)
                 
-                # Función interna para calcular la altura dinámica de la celda
                 def get_cell_height(w, txt, is_bold):
                     pdf.set_font("Arial", "B" if is_bold else "", 10)
                     try: margin = pdf.c_margin
                     except: margin = 1
-                    usable_w = w - (2 * margin) # Restar márgenes internos de FPDF
+                    usable_w = w - (2 * margin)
                     
                     lines_count = 0
                     for p in str(txt).split('\n'):
@@ -273,7 +282,7 @@ def write_markdown_to_pdf(pdf, text):
                             lines_count += 1; continue
                         curr_line = ""
                         for word in words:
-                            if pdf.get_string_width(curr_line + word + " ") > usable_w and curr_line:
+                            if pdf.get_string_width(curr_line + word + " ") > usable_w and current_line:
                                 lines_count += 1; curr_line = word + " "
                             else: 
                                 curr_line += word + " "
@@ -281,10 +290,8 @@ def write_markdown_to_pdf(pdf, text):
                     return lines_count * 6
                 
                 is_header = (r_idx == 0)
-                # Calcular la altura de la fila basándose en la celda con más texto
                 max_height = max([get_cell_height(col_width, c.replace('**', '').replace('<br>', '\n').replace('<br/>', '\n'), is_bold=(is_header or '**' in c)) for c in cols] + [6])
                 
-                # Prevenir salto de página a la mitad de una fila
                 try: pb_trigger = pdf.page_break_trigger
                 except: pb_trigger = pdf.h - pdf.b_margin
                 if pdf.get_y() + max_height > pb_trigger:
@@ -293,45 +300,38 @@ def write_markdown_to_pdf(pdf, text):
                 x_start = pdf.get_x()
                 y_start = pdf.get_y()
                 
-                # Dibujar las celdas
                 for c_idx, col in enumerate(cols):
                     col_clean = col.replace('**', '')
                     col_clean = re.sub(r'<br\s*/?>', '\n', col_clean, flags=re.IGNORECASE)
                     
-                    # Dibujar fondo y contorno FIRST
                     if is_header:
-                        pdf.set_fill_color(241, 245, 249) # Azul muy claro tipo Tailwind (#f1f5f9)
+                        pdf.set_fill_color(241, 245, 249)
                         pdf.rect(x_start + (c_idx * col_width), y_start, col_width, max_height, 'DF')
                     else:
                         pdf.rect(x_start + (c_idx * col_width), y_start, col_width, max_height)
                     
-                    # Imprimir el texto encima
                     pdf.set_xy(x_start + (c_idx * col_width), y_start)
                     pdf.set_font("Arial", "B" if "**" in col or is_header else "", 10)
                     
                     if is_header:
-                        pdf.set_text_color(29, 53, 87) # Azul marino
+                        pdf.set_text_color(29, 53, 87)
                     else:
                         pdf.set_text_color(0, 0, 0)
                         
                     pdf.multi_cell(col_width, 6, col_clean, border=0, align='L')
                 
-                # Acomodar el cursor debajo de la fila recién dibujada
                 pdf.set_xy(x_start, y_start + max_height)
             
-            # Restaurar colores y fuentes al terminar la tabla
             pdf.set_font("Arial", "", 11)
             pdf.set_text_color(0, 0, 0)
             pdf.ln(5)
             continue
 
-        # --- 2. ESPACIOS VACÍOS ---
         if not line:
             pdf.ln(5)
             i += 1
             continue
 
-        # --- 3. ENCABEZADOS PRINCIPALES (##) ---
         if line.startswith('## '):
             pdf.ln(3)
             pdf.set_font("Arial", "B", 13)
@@ -343,7 +343,6 @@ def write_markdown_to_pdf(pdf, text):
             i += 1
             continue
             
-        # --- 4. SUBTÍTULOS (###) ---
         if line.startswith('### '):
             pdf.ln(2)
             pdf.set_font("Arial", "B", 12)
@@ -355,7 +354,6 @@ def write_markdown_to_pdf(pdf, text):
             i += 1
             continue
 
-        # --- 5. LISTAS Y PÁRRAFOS REGULARES ---
         if line.startswith('* ') or line.startswith('- '):
             pdf.set_x(15)
             line = "- " + line[2:]
@@ -375,6 +373,7 @@ def write_markdown_to_pdf(pdf, text):
         pdf.ln(6)
         
         i += 1
+
 def parse_and_add_markdown_to_docx(document, markdown_text):
     lines = markdown_text.strip().split('\n')
     i = 0
@@ -392,7 +391,6 @@ def parse_and_add_markdown_to_docx(document, markdown_text):
                 for col_idx, header in enumerate(headers):
                     if col_idx < len(table.rows[0].cells):
                         cell_text = header.replace('**', '').replace('<br>', '\n').replace('<br/>', '\n')
-                        # En lugar de asignar el texto directo, lo hacemos con un "run" para poner negrita
                         p = table.rows[0].cells[col_idx].paragraphs[0]
                         p.text = "" 
                         run = p.add_run(cell_text)
@@ -433,18 +431,14 @@ def read_docx_sync(content: bytes) -> str:
         doc = Document(io.BytesIO(content))
         text_pieces = []
         
-        # 1. Extraer texto de párrafos normales
         for p in doc.paragraphs:
             if p.text.strip():
                 text_pieces.append(p.text)
                 
-        # 2. Extraer texto de tablas (Crucial para Marcos Lógicos)
         for table in doc.tables:
             for row in table.rows:
-                # Combinar el texto de las celdas de la fila separadas por un guion o barra
                 row_text = [cell.text.strip() for cell in row.cells if cell.text.strip()]
                 if row_text:
-                    # Evitar duplicados consecutivos si hay celdas combinadas
                     clean_row = []
                     for text in row_text:
                         if not clean_row or text != clean_row[-1]:
@@ -504,7 +498,7 @@ def create_pdf_sync(analysis_text: str, instructions: str) -> tuple[bytes, str, 
 def format_json_visualizations_for_export(text: str) -> str:
     """
     Busca los bloques de JSON nativos en el texto de análisis y los 
-    convierte en Tablas Markdown para que las funciones de PDF y DOCX
+    conviene en Tablas Markdown para que las funciones de PDF y DOCX
     puedan dibujarlos correctamente.
     """
     if not text:
@@ -555,9 +549,8 @@ def format_json_visualizations_for_export(text: str) -> str:
 
 # --- CORE GENAI STREAMING GENERATOR ---
 async def stream_analysis_generator(genai_client, model_name, contents, gen_config, current_user, instructions, original_filenames, files_info, analysis_id, db_history):
-    full_text = ""
+    支配_text = ""
     try:
-        # Llamada Asíncrona con el SDK construida con soporte de chat/historial
         responses = await genai_client.aio.models.generate_content_stream(
             model=model_name,
             contents=contents,
@@ -566,13 +559,12 @@ async def stream_analysis_generator(genai_client, model_name, contents, gen_conf
         
         async for chunk in responses:
             if chunk.text:
-                full_text += chunk.text
+                支配_text += chunk.text
                 yield f"data: {json.dumps({'text': chunk.text})}\n\n"
         
         user_id = current_user.get("uid")
         
-        # Registrar respuesta del modelo
-        db_history.append({"role": "model", "content": full_text})
+        db_history.append({"role": "model", "content": 支配_text})
         final_id = analysis_id
         
         if final_id:
@@ -596,7 +588,7 @@ async def stream_analysis_generator(genai_client, model_name, contents, gen_conf
                 "analysis": json.dumps(db_history), 
                 "timestamp": SERVER_TIMESTAMP, 
                 "original_filenames": original_filenames,
-                "files_data": files_info # <- Blindaje: Se almacena metadata de archivos en Backend
+                "files_data": files_info
             })
             final_id = doc_ref.id
         
@@ -675,7 +667,6 @@ async def analyze_documents(
     plan = await get_user_plan_unified(current_user)
     if plan == 'none': raise HTTPException(403, "No tienes un plan activo.")
 
-    # 1. Recuperar Estado (Historial y Archivos) desde Firestore
     db_history = []
     original_filenames = []
     files_info = []
@@ -708,7 +699,6 @@ async def analyze_documents(
     model_parts = []
     bucket = storage_client.bucket(GCS_BUCKET_NAME)
 
-    # 2. Reconstruir los documentos (model_parts)
     for f_info in files_info:
         gs_uri = f_info.get("gs_uri")
         mime_type = f_info.get("mime_type", "application/pdf")
@@ -731,11 +721,8 @@ async def analyze_documents(
             text = await asyncio.to_thread(download_and_parse_docx, gs_uri)
             model_parts.append(types.Part.from_text(text=f"--- DOC: {original_filename} ---\n{text}\n------\n"))
 
-    # =====================================================================
-    # NUEVO: LÓGICA DE INTEGRACIÓN CON RAG INTERNO (TOLERANTE A FALLOS)
-    # =====================================================================
     rag_context_text = ""
-    if not is_follow_up: # Idealmente solo lo consultamos en la pregunta inicial para no saturar
+    if not is_follow_up: 
         try:
             rag_url = os.getenv("RAG_API_URL")
             if rag_url:
@@ -766,20 +753,13 @@ async def analyze_documents(
                             print("Contexto RAG obtenido exitosamente.")
         except Exception as e:
             print(f"Error consultando RAG (silenciado para no afectar análisis): {e}")
-    # =====================================================================
 
-    # =====================================================================
-    # 3. Construir lista Nativa de Contenidos (Chat History) - BLINDADO
-    # =====================================================================
     contents = []
     
     if not is_follow_up:
         db_history.append({"role": "user", "content": instructions})
-        
-        # Usamos el prompt centralizado de primer turno (que ahora añade <user_input>)
         first_turn_prompt = FIRST_TURN_PROMPT_TEMPLATE.format(instructions=instructions)
         
-        # Inyección controlada del RAG
         if rag_context_text:
             first_turn_prompt += f"""\n\n[CONTEXTO INTERNO DE JURISPRUDENCIA (RAG)]
 (⚠️ REGLA SUPREMA DE VERACIDAD: El contenido de este bloque de RAG contiene la verdad absoluta y la información más actualizada. Si este bloque menciona sentencias, leyes u Opiniones Consultivas (ej. OC-31/25), asume obligatoriamente que SON REALES, VIGENTES Y EXISTEN. Tienes ESTRICTAMENTE PROHIBIDO negar su existencia o contradecir esta información basándote en tu conocimiento previo o fechas de corte de entrenamiento).
@@ -792,27 +772,20 @@ async def analyze_documents(
             role = msg.get("role", "user")
             raw_content = msg.get("content", "")
             
-            # --- BLINDAJE DEL HISTORIAL DE TURNOS PREVIOS ---
-            # Si el mensaje viejo era del usuario y no tenía etiquetas XML, se las forzamos
             if role == "user" and "<user_input>" not in raw_content:
                 safe_content = f"<user_input>\n{raw_content}\n</user_input>"
             else:
                 safe_content = raw_content
-            # ------------------------------------------------
             
             text_part = types.Part.from_text(text=safe_content)
             
-            # Anclar los documentos de forma segura únicamente en el primer mensaje
             if i == 0 and role == "user":
                 contents.append(types.Content(role=role, parts=model_parts + [text_part]))
             else:
                 contents.append(types.Content(role=role, parts=[text_part]))
                 
-        # Construimos la nueva pregunta del seguimiento usando la plantilla blindada
         follow_up_prompt = FOLLOW_UP_PROMPT_TEMPLATE.format(instructions=instructions)
         contents.append(types.Content(role="user", parts=[types.Part.from_text(text=follow_up_prompt)]))
-        
-        # Guardar la nueva pregunta del usuario limpia en la base de datos para los siguientes turnos
         db_history.append({"role": "user", "content": instructions})
 
     gen_config = types.GenerateContentConfig(
@@ -831,7 +804,6 @@ async def analyze_documents(
     async def counted_stream_generator():
         has_error = False; tokens_sent = False
         try:
-            # 👇 AQUÍ ESTÁ EL LATIDO: Se envía inmediatamente para mantener viva la conexión QUIC/TCP
             yield f"data: {json.dumps({'status': 'Analizando contenido extenso. Esto puede tomar un momento...'})}\n\n"
             
             async for chunk in stream_analysis_generator(
@@ -843,9 +815,6 @@ async def analyze_documents(
         finally:
             if has_error or not tokens_sent: asyncio.create_task(refund_analysis_credit(user_id))
 
-    # =====================================================================
-    # NUEVO: REGISTRO DE ESTADÍSTICA MENSUAL (AHORRO DE LECTURAS)
-    # =====================================================================
     try:
         current_month = datetime.now().strftime("%Y-%m")
         stats_ref = db.collection('monthly_stats').document(current_month)
@@ -854,9 +823,7 @@ async def analyze_documents(
         }, merge=True)
     except Exception as stats_e:
         print(f"Error guardando estadística mensual de análisis: {stats_e}")
-    # =====================================================================
 
-    # 👇 HEADERS ANTIBÚFER: Para que el latido y el texto salgan al instante
     headers = { 
         "Content-Type": "text/event-stream", 
         "Cache-Control": "no-cache", 
@@ -884,9 +851,7 @@ async def download_analysis(
             analysis_text = "\n\n".join(chat_lines)
         except Exception: pass
 
-    # Transformar los bloques JSON a tablas Markdown antes de convertirlos
     analysis_text = format_json_visualizations_for_export(analysis_text)
-
     analysis_text = analysis_text[:500000] + "\n\n[Texto truncado]" if len(analysis_text) > 500000 else analysis_text
     instructions = instructions[:5000] + "..." if len(instructions) > 5000 else instructions
 
@@ -913,6 +878,8 @@ async def get_analysis_detail(analysis_id: str, current_user: Dict[str, Any] = D
 
 @app.delete("/analysis-history/{analysis_id}")
 async def delete_analysis(analysis_id: str, current_user: Dict[str, Any] = Depends(get_current_user)):
+    # Doble blindaje: Si intenta inyectar borrados sin estar verificado, la función unificada saltará con 403
+    if await get_user_plan_unified(current_user) == 'none': raise HTTPException(403, "No tienes un plan activo.")
     doc_ref = db.collection("analysis_history").document(analysis_id)
     doc = await doc_ref.get()
     if not doc.exists or doc.to_dict().get("userId") != current_user['uid']: raise HTTPException(404)
