@@ -754,11 +754,16 @@ async def analyze_documents(
         except Exception as e:
             print(f"Error consultando RAG (silenciado para no afectar análisis): {e}")
 
+    # 1. Obtenemos la fecha actual
+    fecha_actual = get_date_utc_minus_6()
+
     contents = []
     
     if not is_follow_up:
         db_history.append({"role": "user", "content": instructions})
-        first_turn_prompt = FIRST_TURN_PROMPT_TEMPLATE.format(instructions=instructions)
+        
+        # 2. Inyectamos la fecha al inicio del primer turno
+        first_turn_prompt = f"Fecha actual del sistema: {fecha_actual}\n\n" + FIRST_TURN_PROMPT_TEMPLATE.format(instructions=instructions)
         
         if rag_context_text:
             first_turn_prompt += f"""\n\n[CONTEXTO INTERNO DE JURISPRUDENCIA (RAG)]
@@ -784,7 +789,8 @@ async def analyze_documents(
             else:
                 contents.append(types.Content(role=role, parts=[text_part]))
                 
-        follow_up_prompt = FOLLOW_UP_PROMPT_TEMPLATE.format(instructions=instructions)
+        # 3. Inyectamos la fecha en los turnos de seguimiento (follow-up)
+        follow_up_prompt = f"Fecha actual del sistema: {fecha_actual}\n\n" + FOLLOW_UP_PROMPT_TEMPLATE.format(instructions=instructions)
         contents.append(types.Content(role="user", parts=[types.Part.from_text(text=follow_up_prompt)]))
         db_history.append({"role": "user", "content": instructions})
 
