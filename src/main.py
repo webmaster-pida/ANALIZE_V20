@@ -78,9 +78,9 @@ db = AsyncClient(project=PROJECT_ID)
 app = FastAPI(title="PIDA Document Analyzer (Streaming, GCS & RAG)")
 
 # --- VARIABLES DE LÍMITES DE NEGOCIO ---
-LIMIT_BASICO_ANALYSIS_DAILY = int(os.getenv("LIMIT_BASICO_ANALYSIS_DAILY", 3))
-LIMIT_AVANZADO_ANALYSIS_DAILY = int(os.getenv("LIMIT_AVANZADO_ANALYSIS_DAILY", 15))
-LIMIT_PREMIUM_ANALYSIS_DAILY = int(os.getenv("LIMIT_PREMIUM_ANALYSIS_DAILY", 25))
+LIMIT_BASICO_ANALYSIS_MONTHLY = int(os.getenv("LIMIT_BASICO_ANALYSIS_MONTHLY", 90))
+LIMIT_AVANZADO_ANALYSIS_MONTHLY = int(os.getenv("LIMIT_AVANZADO_ANALYSIS_MONTHLY", 450))
+LIMIT_PREMIUM_ANALYSIS_MONTHLY = int(os.getenv("LIMIT_PREMIUM_ANALYSIS_MONTHLY", 750))
 
 LIMIT_BASICO_DOCS = int(os.getenv("LIMIT_BASICO_DOCS", 1))
 LIMIT_AVANZADO_DOCS = int(os.getenv("LIMIT_AVANZADO_DOCS", 3))
@@ -110,8 +110,8 @@ app.add_middleware(
 
 # --- MAPAS DE LÍMITES DE NEGOCIO ---
 ANALYSIS_LIMITS = {
-    "basico": LIMIT_BASICO_ANALYSIS_DAILY, "avanzado": LIMIT_AVANZADO_ANALYSIS_DAILY,
-    "premium": LIMIT_PREMIUM_ANALYSIS_DAILY, "vip": -1 
+    "basico": LIMIT_BASICO_ANALYSIS_MONTHLY, "avanzado": LIMIT_AVANZADO_ANALYSIS_MONTHLY,
+    "premium": LIMIT_PREMIUM_ANALYSIS_MONTHLY, "vip": -1 
 }
 DOCS_LIMITS = {
     "basico": LIMIT_BASICO_DOCS, "avanzado": LIMIT_AVANZADO_DOCS,
@@ -127,6 +127,12 @@ def get_date_utc_minus_6() -> str:
     utc_now = datetime.now(timezone.utc)
     cst_now = utc_now - timedelta(hours=6)
     return cst_now.strftime('%Y-%m-%d')
+
+# NUEVA FUNCIÓN PARA LOS LÍMITES MENSUALES
+def get_month_utc_minus_6() -> str:
+    utc_now = datetime.now(timezone.utc)
+    cst_now = utc_now - timedelta(hours=6)
+    return cst_now.strftime('%Y-%m')
 
 async def get_user_plan_unified(current_user: Dict[str, Any]) -> str:
     user_id = current_user.get('uid')
@@ -165,25 +171,30 @@ async def get_user_plan_unified(current_user: Dict[str, Any]) -> str:
     return 'none'
 
 async def consume_analysis_credit(user_id: str, plan_key: str):
-    limit_daily = ANALYSIS_LIMITS.get(plan_key, 0)
-    if limit_daily == -1: return 
-    today = get_date_utc_minus_6()
-    stats_ref = db.collection('users').document(user_id).collection('usage_stats').document(today)
+    limit_monthly = ANALYSIS_LIMITS.get(plan_key, 0)
+    if limit_monthly == -1: return 
+    
+    current_month = get_month_utc_minus_6()
+    stats_ref = db.collection('users').document(user_id).collection('usage_stats').document(current_month)
     
     @firestore.async_transactional
     async def check_and_increment(transaction, ref):
         snapshot = await ref.get(transaction=transaction)
         data = snapshot.to_dict() if snapshot.exists else {}
         current_count = data.get('analysis_count', 0)
-        if current_count >= limit_daily:
-            raise HTTPException(status_code=429, detail=f"Límite diario alcanzado para el plan {plan_key}")
+        
+        if current_count >= limit_monthly:
+            raise HTTPException(status_code=429, detail=f"Límite mensual alcanzado para el plan {plan_key}")
+            
         transaction.set(ref, {'analysis_count': current_count + 1, 'last_updated': firestore.SERVER_TIMESTAMP}, merge=True)
+        
     transaction = db.transaction()
     await check_and_increment(transaction, stats_ref)
 
 async def refund_analysis_credit(user_id: str):
-    today = get_date_utc_minus_6()
-    stats_ref = db.collection('users').document(user_id).collection('usage_stats').document(today)
+    current_month = get_month_utc_minus_6()
+    stats_ref = db.collection('users').document(user_id).collection('usage_stats').document(current_month)
+    
     @firestore.async_transactional
     async def check_and_decrement(transaction, ref):
         snapshot = await ref.get(transaction=transaction)
@@ -191,6 +202,7 @@ async def refund_analysis_credit(user_id: str):
             current_count = (snapshot.to_dict() or {}).get('analysis_count', 0)
             if current_count > 0:
                 transaction.update(ref, {'analysis_count': current_count - 1, 'last_updated': firestore.SERVER_TIMESTAMP})
+                
     try:
         transaction = db.transaction()
         await check_and_decrement(transaction, stats_ref)
