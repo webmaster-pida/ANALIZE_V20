@@ -153,21 +153,25 @@ async def get_user_plan_unified(current_user: Dict[str, Any]) -> str:
     if (email_domain in admin_domains) or (user_email in admin_emails): 
         return 'vip'
 
-    # 2. BLINDAJE AUTOMÁTICO DE SEGURIDAD: Denegar acceso instantáneo a usuarios normales si el correo es falso/no verificado
+    # 2. VERIFICAR SI YA ES UN CLIENTE QUE PAGA (Protege a los clientes antiguos)
+    try:
+        cust_doc = await db.collection('customers').document(user_id).get()
+        if cust_doc.exists:
+            data = cust_doc.to_dict()
+            if data.get('status') in ['active', 'trialing']:
+                # Es un cliente con suscripción activa, pasa sin importar la verificación de correo
+                return data.get('plan', 'basico').lower()
+    except Exception as e:
+        print(f"Error consultando plan en DB: {e}")
+
+    # 3. BLINDAJE AUTOMÁTICO DE SEGURIDAD: Solo aplica si NO es cliente activo
     if not email_verified:
         raise HTTPException(
             status_code=403, 
             detail="Tu dirección de correo electrónico no ha sido verificada. Por favor, haz clic en el enlace enviado a tu bandeja de entrada antes de utilizar el analizador."
         )
 
-    try:
-        cust_doc = await db.collection('customers').document(user_id).get()
-        if cust_doc.exists:
-            data = cust_doc.to_dict()
-            if data.get('status') in ['active', 'trialing']:
-                return data.get('plan', 'basico').lower()
-    except Exception as e:
-        print(f"Error consultando plan en DB: {e}")
+    # 4. Si el correo está verificado pero no tiene suscripción
     return 'none'
 
 async def consume_analysis_credit(user_id: str, plan_key: str):
