@@ -5,8 +5,8 @@ import json
 import io
 import re
 import asyncio
-import httpx  # <-- Para consultar el RAG
-import fitz  # PyMuPDF para comprimir PDFs
+import httpx  
+import fitz  
 from fastapi import FastAPI, File, Form, UploadFile, HTTPException, Response, Depends, Body
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse 
@@ -31,51 +31,63 @@ from src.core.prompts import ANALYZER_SYSTEM_PROMPT, FIRST_TURN_PROMPT_TEMPLATE,
 # Cargar variables
 load_dotenv()
 
-# --- CONFIGURACIÓN GENAI Y STORAGE ---
-try:
-    raw_credentials, project_id_default = google.auth.default()
-    PROJECT_ID = os.getenv("PROJECT_ID", project_id_default)
-    
-    from google.auth.compute_engine.credentials import Credentials as ComputeEngineCredentials
-    from google.auth import impersonated_credentials
-    
-    if isinstance(raw_credentials, ComputeEngineCredentials):
-        print("Entorno Cloud Run detectado. Impersonando cuenta para firmar URLs...")
-        credentials = impersonated_credentials.Credentials(
-            source_credentials=raw_credentials,
-            target_principal="analize-v20@pida-ai-v20.iam.gserviceaccount.com",
-            # ✅ URL LIMPIA:
-            target_scopes=["https://www.googleapis.com/auth/cloud-platform"],
-            lifetime=3600
-        )
-    else:
-        credentials = raw_credentials
-
-except Exception as e:
-    print(f"Error configurando credenciales: {e}")
-    PROJECT_ID = os.getenv("PROJECT_ID")
-    credentials = None
-
+# --- VARIABLES GLOBALES ---
 LOCATION = os.getenv("GOOGLE_CLOUD_LOCATION", "us-central1")
 GEMINI_MODEL_NAME = os.getenv("GEMINI_MODEL", "gemini-2.5-pro").strip()
 GCS_BUCKET_NAME = os.getenv("GCS_BUCKET_NAME", "pida-ai-temp-docs")
+PROJECT_ID = os.getenv("PROJECT_ID")
 
-# Inicialización de Clientes
-genai_client = None
-storage_client = None
-if PROJECT_ID:
-    try:
-        # Nuevo cliente de GenAI
-        genai_client = genai.Client(vertexai=True, project=PROJECT_ID, location=LOCATION)
-        storage_client = storage.Client(project=PROJECT_ID, credentials=credentials) 
-        print(f"GenAI y Storage inicializados: {PROJECT_ID}")
-    except Exception as e:
-        print(f"Error inicializando GCP: {e}")
+# Clientes nulos al arrancar (Carga Diferida para evitar Cold Starts masivos)
+_credentials = None
+_storage_client = None
+_genai_client = None
 
-# Inicializar Firestore
+# Inicializar Firestore (Asíncrono, no bloquea el arranque)
 db = AsyncClient(project=PROJECT_ID)
 
 app = FastAPI(title="PIDA Document Analyzer (Streaming, GCS & RAG)")
+
+# --- INICIALIZADORES PEREZOSOS (LAZY LOADING) ---
+def _init_gcp_clients():
+    """Inicializa los clientes pesados de Google solo cuando se necesitan por primera vez."""
+    global _credentials, _storage_client, _genai_client, PROJECT_ID
+    if _storage_client is not None and _genai_client is not None:
+        return
+
+    print("Inicializando clientes GCP (Lazy Load)...")
+    try:
+        raw_credentials, project_id_default = google.auth.default()
+        if not PROJECT_ID:
+            PROJECT_ID = os.getenv("PROJECT_ID", project_id_default)
+        
+        from google.auth.compute_engine.credentials import Credentials as ComputeEngineCredentials
+        from google.auth import impersonated_credentials
+        
+        if isinstance(raw_credentials, ComputeEngineCredentials):
+            print("Entorno Cloud Run detectado. Impersonando cuenta para firmar URLs...")
+            _credentials = impersonated_credentials.Credentials(
+                source_credentials=raw_credentials,
+                target_principal="analize-v20@pida-ai-v20.iam.gserviceaccount.com",
+                target_scopes=["https://www.googleapis.com/auth/cloud-platform"],
+                lifetime=3600
+            )
+        else:
+            _credentials = raw_credentials
+
+        _storage_client = storage.Client(project=PROJECT_ID, credentials=_credentials)
+        _genai_client = genai.Client(vertexai=True, project=PROJECT_ID, location=LOCATION)
+        print("GenAI y Storage inicializados correctamente.")
+    except Exception as e:
+        print(f"Error crítico inicializando GCP: {e}")
+        raise e
+
+def get_storage_client():
+    if _storage_client is None: _init_gcp_clients()
+    return _storage_client
+
+def get_genai_client():
+    if _genai_client is None: _init_gcp_clients()
+    return _genai_client
 
 # --- VARIABLES DE LÍMITES DE NEGOCIO ---
 LIMIT_BASICO_ANALYSIS_MONTHLY = int(os.getenv("LIMIT_BASICO_ANALYSIS_MONTHLY", 90))
@@ -298,7 +310,7 @@ def write_markdown_to_pdf(pdf, text):
                             lines_count += 1; continue
                         curr_line = ""
                         for word in words:
-                            if pdf.get_string_width(curr_line + word + " ") > usable_w and current_line:
+                            if pdf.get_string_width(curr_line + word + " ") > usable_w and curr_line:
                                 lines_count += 1; curr_line = word + " "
                             else: 
                                 curr_line += word + " "
@@ -469,7 +481,7 @@ def read_docx_sync(content: bytes) -> str:
 def download_and_parse_docx(gs_uri: str) -> str:
     try:
         blob_path = "/".join(gs_uri.replace("gs://", "").split("/")[1:])
-        bucket = storage_client.bucket(GCS_BUCKET_NAME)
+        bucket = get_storage_client().bucket(GCS_BUCKET_NAME)
         content = bucket.blob(blob_path).download_as_bytes()
         return read_docx_sync(content)
     except Exception as e:
@@ -564,10 +576,10 @@ def format_json_visualizations_for_export(text: str) -> str:
 
 
 # --- CORE GENAI STREAMING GENERATOR ---
-async def stream_analysis_generator(genai_client, model_name, contents, gen_config, current_user, instructions, original_filenames, files_info, analysis_id, db_history):
+async def stream_analysis_generator(current_genai_client, model_name, contents, gen_config, current_user, instructions, original_filenames, files_info, analysis_id, db_history):
     支配_text = ""
     try:
-        responses = await genai_client.aio.models.generate_content_stream(
+        responses = await current_genai_client.aio.models.generate_content_stream(
             model=model_name,
             contents=contents,
             config=gen_config
@@ -638,7 +650,7 @@ async def compress_and_upload(file: UploadFile = File(...), current_user: Dict[s
 
         compressed_bytes = await asyncio.to_thread(compress_pdf, file_bytes)
         new_size = len(compressed_bytes) / (1024 * 1024)
-        bucket = storage_client.bucket(GCS_BUCKET_NAME)
+        bucket = get_storage_client().bucket(GCS_BUCKET_NAME)
         safe_name = re.sub(r'[^a-zA-Z0-9_.-]', '', file.filename.replace(' ', '_'))
         blob_path = f"uploads/{user_id}/{int(datetime.now().timestamp())}_opt_{safe_name}"
         blob = bucket.blob(blob_path)
@@ -661,7 +673,7 @@ async def generate_upload_urls(payload: Dict[str, Any] = Body(...), current_user
     if max_docs != -1 and len(files_req) > max_docs: raise HTTPException(403, f"Tu plan permite {max_docs} documento(s) a la vez.")
 
     urls_response = []
-    bucket = storage_client.bucket(GCS_BUCKET_NAME)
+    bucket = get_storage_client().bucket(GCS_BUCKET_NAME)
     for f in files_req:
         safe_name = re.sub(r'[^a-zA-Z0-9_.-]', '', f.get("name", "doc").replace(' ', '_'))
         blob_path = f"uploads/{user_id}/{int(datetime.now().timestamp())}_{safe_name}"
@@ -677,7 +689,8 @@ async def analyze_documents(
     files_data: str = Form("[]"), instructions: str = Form(...), analysis_id: str = Form(""),
     current_user: Dict[str, Any] = Depends(get_current_user)
 ):
-    if not genai_client: raise HTTPException(500, "El cliente de IA no está inicializado.")
+    current_genai_client = get_genai_client()
+    if not current_genai_client: raise HTTPException(500, "El cliente de IA falló al inicializarse.")
     
     user_id = current_user['uid']
     plan = await get_user_plan_unified(current_user)
@@ -713,7 +726,7 @@ async def analyze_documents(
 
     max_size_mb = PLAN_SIZE_LIMITS.get(plan, 10)
     model_parts = []
-    bucket = storage_client.bucket(GCS_BUCKET_NAME)
+    bucket = get_storage_client().bucket(GCS_BUCKET_NAME)
 
     for f_info in files_info:
         gs_uri = f_info.get("gs_uri")
@@ -829,7 +842,7 @@ async def analyze_documents(
             yield f"data: {json.dumps({'status': 'Analizando contenido extenso. Esto puede tomar un momento...'})}\n\n"
             
             async for chunk in stream_analysis_generator(
-                genai_client, GEMINI_MODEL_NAME, contents, gen_config, current_user, instructions, original_filenames, files_info, analysis_id, db_history
+                current_genai_client, GEMINI_MODEL_NAME, contents, gen_config, current_user, instructions, original_filenames, files_info, analysis_id, db_history
             ):
                 if '"error":' in chunk: has_error = True
                 if '"text":' in chunk and not has_error: tokens_sent = True
