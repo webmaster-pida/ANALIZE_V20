@@ -828,6 +828,10 @@ async def analyze_documents(
         temperature=float(os.getenv("GEMINI_TEMP", "0.4")),
         top_p=float(os.getenv("GEMINI_TOP_P", "0.95")),
         max_output_tokens=65535,
+        # DESACTIVA ADVERTENCIA AFC
+        automatic_function_calling=types.AutomaticFunctionCallingConfig(
+            disable=True
+        ),
         safety_settings=[
             types.SafetySetting(category="HARM_CATEGORY_HATE_SPEECH", threshold="BLOCK_ONLY_HIGH"),
             types.SafetySetting(category="HARM_CATEGORY_DANGEROUS_CONTENT", threshold="BLOCK_ONLY_HIGH"),
